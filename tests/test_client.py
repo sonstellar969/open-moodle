@@ -116,3 +116,67 @@ def test_download_file_size_limit_exceeded():
             client.download_file("https://lms.college.edu/pluginfile.php/1/huge.pdf", max_bytes=1024 * 1024)
 
     client.close()
+
+
+def test_calculate_attendance_metrics():
+    from open_moodle.client import calculate_attendance_metrics
+
+    # Over threshold (34/44 = 77.27% -> 1 safe bunk)
+    m1 = calculate_attendance_metrics(34, 44, threshold=75.0)
+    assert m1["status"] == "OK"
+    assert m1["percentage"] == 77.27
+    assert m1["safe_bunks"] == 1
+    assert m1["recovery_needed"] == 0
+
+    # Below threshold (24/43 = 55.81% -> 33 classes needed)
+    m2 = calculate_attendance_metrics(24, 43, threshold=75.0)
+    assert m2["status"] == "BELOW TARGET"
+    assert m2["percentage"] == 55.81
+    assert m2["safe_bunks"] == 0
+    assert m2["recovery_needed"] == 33
+
+    # Zero sessions
+    m3 = calculate_attendance_metrics(0, 0, threshold=75.0)
+    assert m3["status"] == "OK"
+    assert m3["safe_bunks"] == 0
+
+
+def test_get_attendance_via_mod_attendance():
+    client = MoodleClient("https://lms.college.edu", "secret_tok")
+    client._available_functions = {"mod_attendance_get_attendance"}
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "courses": [
+            {
+                "courseid": 201,
+                "coursename": "Operating Systems",
+                "totalsessions": 44,
+                "attended": 34,
+                "percentage": 77.27,
+            }
+        ]
+    }
+    mock_resp.raise_for_status.return_value = None
+
+    with patch.object(client._http, "post", return_value=mock_resp):
+        records = client.get_attendance()
+        assert len(records) == 1
+        assert records[0]["course_name"] == "Operating Systems"
+        assert records[0]["attended"] == 34
+        assert records[0]["total_sessions"] == 44
+        assert records[0]["percentage"] == 77.27
+
+    client.close()
+
+
+def test_get_attendance_capability_error():
+    client = MoodleClient("https://lms.college.edu", "secret_tok")
+    client._available_functions = {"core_webservice_get_site_info"}
+    client._site_info = {"sitename": "Test"}
+
+    with pytest.raises(CapabilityError, match="Attendance tracking functions"):
+        client.get_attendance()
+
+    client.close()
+

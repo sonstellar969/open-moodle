@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+import base64
+import http.server
+import re
+import secrets
+import threading
+import time
+from typing import Any, Optional
+import urllib.parse
+import webbrowser
 import httpx
 
 from open_moodle.config import get_base_url, normalize_moodle_url
@@ -99,3 +107,130 @@ def verify_credentials(
         raise AuthenticationError("Received unexpected response from Moodle endpoint.")
 
     return body
+
+
+def extract_token_from_callback(raw_input: str, passport: str = "") -> Optional[str]:
+    """Extract and decode a Moodle mobile token from callback URL or token string."""
+    text = raw_input.strip()
+    if not text:
+        return None
+
+    # Check if raw input is already a 32-character hex token
+    if re.fullmatch(r"[a-fA-F0-9]{32}", text):
+        return text
+
+    # Parse query or fragment from URL
+    candidate = text
+    if "token=" in text:
+        m = re.search(r"token=([^&#\s]+)", text)
+        if m:
+            candidate = m.group(1)
+
+    # Try decoding base64 if it looks like passport:::token or siteurl:::token
+    try:
+        padded = candidate + "=" * (-len(candidate) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        if ":::" in decoded:
+            parts = decoded.split(":::")
+            for part in reversed(parts):
+                clean_part = part.strip()
+                if re.fullmatch(r"[a-fA-F0-9]{32}", clean_part):
+                    return clean_part
+            if parts[-1].strip():
+                return parts[-1].strip()
+    except Exception:
+        pass
+
+    if re.fullmatch(r"[a-fA-F0-9]{32}", candidate):
+        return candidate
+
+    return candidate or None
+
+
+def login_sso(
+    site_url: str,
+    timeout: float = 120.0,
+    service: str = "moodle_mobile_app",
+) -> tuple[str, str]:
+    """Perform browser-assisted SSO login and capture token.
+
+    Returns tuple of (token, launch_url).
+    """
+    clean_url = normalize_moodle_url(site_url)
+    base = get_base_url(clean_url)
+    passport = secrets.token_hex(16)
+
+    captured_token: list[str] = []
+    shutdown_event = threading.Event()
+
+    class SSOHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            parsed = urllib.parse.urlsplit(self.path)
+            qs = dict(urllib.parse.parse_qsl(parsed.query))
+            token_candidate = qs.get("token") or ""
+
+            extracted = extract_token_from_callback(token_candidate, passport=passport)
+            if extracted:
+                captured_token.append(extracted)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                html = """
+                <!DOCTYPE html>
+                <html>
+                <head><title>Moodle Login Success</title></head>
+                <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 80vh; margin: 0; background: #f8fafc;">
+                    <div style="background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); text-align: center; max-width: 450px;">
+                        <h2 style="color: #16a34a; margin-top: 0;">Authentication Successful</h2>
+                        <p style="color: #475569;">open-moodle has received your token. You may close this tab and return to your terminal.</p>
+                    </div>
+                </body>
+                </html>
+                """
+                self.wfile.write(html.strip().encode("utf-8"))
+                shutdown_event.set()
+            else:
+                self.send_response(400)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"No valid token found in callback request.")
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), SSOHandler)
+    server.timeout = 1.0
+    port = server.server_port
+
+    callback_url = f"http://127.0.0.1:{port}/callback"
+    launch_url = (
+        f"{base}/admin/tool/mobile/launch.php?"
+        f"service={service}&passport={passport}&urlscheme={urllib.parse.quote(callback_url)}"
+    )
+
+    def serve():
+        while not shutdown_event.is_set():
+            server.handle_request()
+
+    listener_thread = threading.Thread(target=serve, daemon=True)
+    listener_thread.start()
+
+    try:
+        webbrowser.open(launch_url)
+    except Exception:
+        pass
+
+    start_time = time.time()
+    try:
+        while time.time() - start_time < timeout:
+            if shutdown_event.is_set() and captured_token:
+                return captured_token[0], launch_url
+            time.sleep(0.5)
+    finally:
+        server.server_close()
+
+    if captured_token:
+        return captured_token[0], launch_url
+
+    raise AuthenticationError("SSO login timed out waiting for browser callback.")
+

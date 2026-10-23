@@ -10,9 +10,16 @@ try:
 except ImportError:
     from mcp.server.fastmcp import FastMCP as MCPServer
 
-from open_moodle.client import CapabilityError, FileTooLargeError, MoodleAPIError, MoodleClient
+from open_moodle.client import (
+    CapabilityError,
+    FileTooLargeError,
+    MoodleAPIError,
+    MoodleClient,
+    calculate_attendance_metrics,
+)
 from open_moodle.config import get_credentials
 from open_moodle.parsers import extract_content, strip_html
+from open_moodle.search import index_course_materials, search_index
 
 
 def create_server(
@@ -275,6 +282,92 @@ def create_server(
             return "\n".join(output)
 
     @server.tool()
+    def moodle_get_attendance(threshold: float = 75.0) -> str:
+        """Fetch attendance records across enrolled courses with 75% threshold analytics."""
+        with _get_client() as client:
+            try:
+                records = client.get_attendance()
+            except CapabilityError as e:
+                return f"Attendance feature unavailable: {e}"
+
+            if not records:
+                return "No attendance records found."
+
+            total_sessions = sum(r["total_sessions"] for r in records)
+            total_attended = sum(r["attended"] for r in records)
+            overall_pct = (
+                round((total_attended / total_sessions) * 100.0, 2)
+                if total_sessions > 0
+                else 0.0
+            )
+
+            output = [
+                f"# Attendance Summary (Target: {threshold}%)\n",
+                f"**Overall Attendance**: {total_attended}/{total_sessions} ({overall_pct}%)\n",
+                "| Course | Attended | Total | % | Status | Safe Bunks / Needed |",
+                "|---|---|---|---|---|---|",
+            ]
+
+            for r in records:
+                metrics = calculate_attendance_metrics(
+                    r["attended"], r["total_sessions"], threshold=threshold
+                )
+                c_name = r["course_name"]
+                att = r["attended"]
+                tot = r["total_sessions"]
+                pct = metrics["percentage"]
+                st = metrics["status"]
+
+                if metrics["status"] == "OK":
+                    margin = (
+                        f"+{metrics['safe_bunks']} safe bunks"
+                        if metrics["safe_bunks"] > 0
+                        else "On track"
+                    )
+                else:
+                    margin = f"⚠️ Needs {metrics['recovery_needed']} classes"
+
+                output.append(f"| {c_name} | {att} | {tot} | {pct}% | {st} | {margin} |")
+
+            return "\n".join(output)
+
+    @server.tool()
+    def moodle_search(query: str, course_id: Optional[int] = None, limit: int = 5) -> str:
+        """Search local index of course documents, lecture notes, and syllabus files using BM25."""
+        results = search_index(query=query, course_id=course_id, limit=limit)
+        if not results:
+            scope = f" in course {course_id}" if course_id else ""
+            return (
+                f"No matching documents found for '{query}'{scope}.\n"
+                "Tip: If course files have not been indexed yet, call `moodle_sync_course(course_id)`."
+            )
+
+        output = [f"# Search Results for: '{query}'\n"]
+        for r in results:
+            c_name = r["course_name"]
+            f_name = r["filename"]
+            loc = r["page_or_chunk"]
+            snip = r["snippet"].replace("<b>", "**").replace("</b>", "**")
+
+            output.append(f"### {f_name} ({loc})")
+            output.append(f"- **Course**: {c_name}")
+            output.append(f"- **Excerpt**: {snip}\n")
+
+        return "\n".join(output)
+
+    @server.tool()
+    def moodle_sync_course(course_id: int) -> str:
+        """Download and index all text documents for a course into local SQLite FTS5 index."""
+        with _get_client() as client:
+            res = index_course_materials(client, course_id=course_id)
+            return (
+                f"Course {res['course_name']} (ID: {course_id}) synced successfully.\n"
+                f"- Indexed new documents: {res['indexed']}\n"
+                f"- Already up to date: {res['skipped']}\n"
+                f"- Failed / non-parseable: {res['failed']}"
+            )
+
+    @server.tool()
     def moodle_brief(days: int = 7) -> str:
         """Consolidated briefing: enrolled courses, deadlines in the next N days, and pending tasks."""
         with _get_client() as client:
@@ -292,7 +385,28 @@ def create_server(
             except Exception as e:
                 lines.append(f"_Could not load courses: {e}_\n")
 
-            # 2. Upcoming events & deadlines
+            # 2. Attendance alerts
+            try:
+                att_records = client.get_attendance()
+                if att_records:
+                    at_risk = []
+                    for r in att_records:
+                        m = calculate_attendance_metrics(r["attended"], r["total_sessions"], threshold=75.0)
+                        if m["status"] == "BELOW TARGET":
+                            at_risk.append((r["course_name"], r["attended"], r["total_sessions"], m["percentage"], m["recovery_needed"]))
+
+                    lines.append(f"## Attendance Status\n")
+                    if at_risk:
+                        lines.append("⚠️ **Courses Below 75% Cutoff:**")
+                        for name, att, tot, pct, needed in at_risk:
+                            lines.append(f"- **{name}**: {att}/{tot} ({pct}%) — Needs **{needed}** consecutive sessions")
+                    else:
+                        lines.append("✅ All courses meeting 75% attendance threshold.")
+                    lines.append("")
+            except Exception:
+                pass
+
+            # 3. Upcoming events & deadlines
             try:
                 events = client.get_upcoming_events(days_ahead=days)
                 lines.append(f"## Upcoming Deadlines & Events ({len(events)})\n")
@@ -309,7 +423,7 @@ def create_server(
             except Exception as e:
                 lines.append(f"_Could not check deadlines: {e}_\n")
 
-            # 3. Unread notifications
+            # 4. Unread notifications
             try:
                 notifs = client.get_notifications(limit=5)
                 unread = [n for n in notifs if not n.get("read")]

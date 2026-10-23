@@ -24,11 +24,14 @@ Connecting AI models to university Moodle portals usually fails due to practical
 ## Features
 
 - **Model Context Protocol Server**: Compatible with Antigravity, Claude Desktop, Cursor, and Grok over standard I/O (stdio).
+- **Attendance & Threshold Analytics**: Tracks attendance records across courses with automated 75% target threshold calculation (safe bunks allowed vs consecutive sessions needed to recover).
+- **Zero-Dependency Local Search**: Embedded SQLite FTS5 index allows sub-second keyword search across course PDFs, slides, and docs with BM25 snippet ranking.
+- **Bulk Course Downloader**: Downloads course files organized into topic directories, skipping unmodified files automatically.
 - **In-Memory Document Extraction**: Converts PDFs, Word `.docx`, and PowerPoint `.pptx` slide decks directly into text without external system dependencies like LibreOffice.
 - **Bounded Downloads**: Caps file transfers at 25MB and supports windowed reading (`start_page` and `max_pages`) to protect context windows.
 - **Assignment Submission Status**: Checks whether you turned in each assignment (`submitted`, `draft`, `new`) alongside due dates and grading states.
-- **Course Announcements & Briefing**: Pulls genuine instructor posts from course news forums, and offers a single-call `moodle_brief` tool summarizing deadlines, notifications, and active courses.
-- **Terminal CLI**: Run commands like `open-moodle brief`, `open-moodle courses`, or `open-moodle announcements <course_id>` directly in your shell.
+- **Course Announcements & Briefing**: Pulls genuine instructor posts from course news forums, and offers a single-call `moodle_brief` tool summarizing deadlines, attendance alerts, notifications, and active courses.
+- **Terminal CLI**: Run commands like `open-moodle attendance`, `open-moodle search`, `open-moodle download`, or `open-moodle brief` directly in your shell.
 - **Zero-Install Execution**: Works instantly with `uvx open-moodle` or via standard `pip`/`pipx`.
 
 ---
@@ -130,7 +133,10 @@ See the [Client Setup Guide](docs/client-setup.md) for full instructions coverin
 
 | Tool | Purpose |
 |------|---------|
-| `moodle_brief` | Consolidated student briefing: enrolled courses, deadlines in the next N days, and notifications in one call. |
+| `moodle_brief` | Consolidated student briefing: enrolled courses, attendance alerts, deadlines, and notifications. |
+| `moodle_get_attendance` | Fetches course attendance with percentage and safe bunks / recovery targets for target thresholds. |
+| `moodle_search` | Sub-second full-text BM25 search across indexed course slides, PDFs, and notes. |
+| `moodle_sync_course` | Indexes all text materials for a course into local SQLite FTS5 database. |
 | `moodle_whoami` | Checks connection and returns student profile metadata and allowed API count. |
 | `moodle_list_courses` | Returns enrolled courses with numeric IDs, full titles, and short codes. |
 | `moodle_get_course_contents` | Outlines syllabus sections, modules, and resources (with sanitized URLs). |
@@ -144,6 +150,28 @@ See the [Client Setup Guide](docs/client-setup.md) for full instructions coverin
 ---
 
 ## CLI Usage
+
+### Check attendance and safe bunks (75% threshold)
+
+```bash
+open-moodle attendance --threshold 75.0
+```
+
+### Search course notes and slides locally
+
+```bash
+# Index course materials first
+open-moodle sync 201
+
+# Fast BM25 keyword search across all indexed documents
+open-moodle search "virtual memory" --course 201
+```
+
+### Bulk download course materials
+
+```bash
+open-moodle download 201 --dest ./OS-Materials
+```
 
 ### Get a quick student briefing
 

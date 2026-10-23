@@ -5,7 +5,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 import pytest
 
-from open_moodle.auth import AuthenticationError, request_token, verify_credentials
+from open_moodle.auth import (
+    AuthenticationError,
+    extract_token_from_callback,
+    request_token,
+    verify_credentials,
+)
 
 
 def test_request_token_success():
@@ -47,3 +52,19 @@ def test_verify_credentials_success():
         info = verify_credentials("https://lms.college.edu", "valid_token")
         assert info["sitename"] == "University LMS"
         assert info["fullname"] == "John Doe"
+
+
+def test_extract_token_from_callback():
+    # Direct 32-char hex token
+    raw_token = "e6bdc79cba06e4746aa10d0a5783f997"
+    assert extract_token_from_callback(raw_token) == raw_token
+
+    # URL query param
+    url = f"http://127.0.0.1:8080/callback?token={raw_token}"
+    assert extract_token_from_callback(url) == raw_token
+
+    # Base64 encoded passport:::token
+    import base64
+    payload = base64.b64encode(f"passport123:::{raw_token}".encode("utf-8")).decode("utf-8")
+    assert extract_token_from_callback(f"moodlemobile://token={payload}") == raw_token
+

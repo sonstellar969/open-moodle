@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import time
 from typing import Any, Optional
 import urllib.parse
 import httpx
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from open_moodle.config import get_base_url, normalize_moodle_url
 
@@ -27,6 +31,45 @@ class CapabilityError(MoodleAPIError):
 class FileTooLargeError(Exception):
     """Raised when a file download exceeds the allowed memory/byte limit."""
     pass
+
+
+def calculate_attendance_metrics(attended: int, total: int, threshold: float = 75.0) -> dict[str, Any]:
+    """Calculate attendance percentage, safe bunks, or classes needed to hit target threshold."""
+    if total <= 0:
+        return {
+            "percentage": 100.0,
+            "status": "OK",
+            "safe_bunks": 0,
+            "recovery_needed": 0,
+        }
+
+    pct = round((attended / total) * 100.0, 2)
+    t_ratio = threshold / 100.0
+
+    if pct >= threshold:
+        # Maximum additional sessions a student can miss: (attended / (total + k)) >= t_ratio
+        if t_ratio > 0:
+            safe = int((attended - (t_ratio * total)) / t_ratio)
+        else:
+            safe = 0
+        return {
+            "percentage": pct,
+            "status": "OK",
+            "safe_bunks": max(0, safe),
+            "recovery_needed": 0,
+        }
+    else:
+        # Minimum consecutive sessions a student must attend: (attended + m) / (total + m) >= t_ratio
+        if t_ratio < 1.0:
+            needed = math.ceil(((t_ratio * total) - attended) / (1.0 - t_ratio))
+        else:
+            needed = 0
+        return {
+            "percentage": pct,
+            "status": "BELOW TARGET",
+            "safe_bunks": 0,
+            "recovery_needed": max(0, needed),
+        }
 
 
 def strip_token_from_url(url: str) -> str:
@@ -398,3 +441,65 @@ class MoodleClient:
                         f"File exceeds maximum download size limit of {limit_mb}MB."
                     )
             return bytes(content)
+
+    def get_attendance(self) -> list[dict[str, Any]]:
+        """Fetch attendance records across enrolled courses.
+
+        First attempts mod_attendance_get_attendance. If unavailable, inspects
+        course grade items for attendance entries as a fallback.
+        """
+        funcs = self.get_available_functions()
+
+        if "mod_attendance_get_attendance" in funcs:
+            res = self.call("mod_attendance_get_attendance")
+            if isinstance(res, dict) and "courses" in res:
+                records = []
+                for item in res["courses"]:
+                    total = int(item.get("totalsessions", 0))
+                    attended = int(item.get("attended", 0))
+                    pct_raw = item.get("percentage", 0.0)
+                    try:
+                        pct = float(pct_raw)
+                    except (ValueError, TypeError):
+                        pct = round((attended / total * 100.0), 2) if total > 0 else 0.0
+
+                    records.append({
+                        "course_id": item.get("courseid", 0),
+                        "course_name": item.get("coursename", "Unknown Course"),
+                        "total_sessions": total,
+                        "attended": attended,
+                        "percentage": pct,
+                    })
+                return records
+
+        if "gradereport_user_get_grade_items" in funcs:
+            try:
+                user_grades = self.get_user_grades()
+                records = []
+                for ug in user_grades:
+                    c_id = ug.get("courseid", 0)
+                    for item in ug.get("gradeitems", []):
+                        item_name = item.get("itemname") or ""
+                        if "attendance" in item_name.lower():
+                            raw = item.get("graderaw")
+                            max_val = item.get("grademax")
+                            pct_str = str(item.get("percentageformatted") or "")
+                            pct_clean = pct_str.replace("%", "").strip()
+                            try:
+                                pct = float(pct_clean)
+                            except ValueError:
+                                pct = 0.0
+                            records.append({
+                                "course_id": c_id,
+                                "course_name": item.get("coursename") or f"Course {c_id}",
+                                "total_sessions": int(max_val) if max_val is not None else 0,
+                                "attended": int(raw) if raw is not None else 0,
+                                "percentage": pct,
+                            })
+                if records:
+                    return records
+            except Exception:
+                pass
+
+        raise CapabilityError("Attendance tracking functions (mod_attendance_get_attendance) are not enabled on this Moodle server.")
+

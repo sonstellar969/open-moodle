@@ -49,3 +49,32 @@ def test_cli_brief_routed():
         code = main(["brief", "--days", "7", "--url", "https://test.edu", "--token", "tok"])
         assert code == 0
         mock_brief.assert_called_once()
+
+
+def test_cli_attendance_routed():
+    with patch("open_moodle.cli.cmd_attendance", return_value=0) as mock_att:
+        code = main(["attendance", "--threshold", "80.0", "--url", "https://test.edu", "--token", "tok"])
+        assert code == 0
+        mock_att.assert_called_once()
+
+
+def test_cli_search_routed():
+    with patch("open_moodle.cli.cmd_search", return_value=0) as mock_search:
+        code = main(["search", "paging", "--course", "201"])
+        assert code == 0
+        mock_search.assert_called_once()
+
+
+def test_cli_sync_routed():
+    with patch("open_moodle.cli.cmd_sync", return_value=0) as mock_sync:
+        code = main(["sync", "201", "--url", "https://test.edu", "--token", "tok"])
+        assert code == 0
+        mock_sync.assert_called_once()
+
+
+def test_cli_download_routed():
+    with patch("open_moodle.cli.cmd_download", return_value=0) as mock_dl:
+        code = main(["download", "201", "--dest", "/tmp/dl", "--url", "https://test.edu", "--token", "tok"])
+        assert code == 0
+        mock_dl.assert_called_once()
+

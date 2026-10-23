@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+from pathlib import Path
 import sys
 from typing import Optional
 
@@ -11,21 +12,35 @@ from rich.console import Console
 from rich.table import Table
 
 from open_moodle import __version__
-from open_moodle.auth import AuthenticationError, request_token, verify_credentials
-from open_moodle.client import CapabilityError, FileTooLargeError, MoodleAPIError, MoodleClient
+from open_moodle.auth import AuthenticationError, login_sso, request_token, verify_credentials
+from open_moodle.client import (
+    CapabilityError,
+    FileTooLargeError,
+    MoodleAPIError,
+    MoodleClient,
+    calculate_attendance_metrics,
+)
 from open_moodle.config import get_credentials, load_config, normalize_moodle_url, save_config
+from open_moodle.downloader import download_course_materials
 from open_moodle.parsers import extract_content, strip_html
+from open_moodle.search import index_course_materials, search_index
 from open_moodle.server import run_stdio
 
 console = Console()
 err_console = Console(stderr=True)
 
 
+def _resolve_creds(args: argparse.Namespace) -> tuple[str, str]:
+    """Helper to resolve URL and token from args or config."""
+    return get_credentials(getattr(args, "url", None), getattr(args, "token", None))
+
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     """Interactively or via flags authenticate with Moodle and save the token."""
     console.print("[bold]open-moodle authentication setup[/bold]\n")
 
-    url = args.url
+    url = getattr(args, "url", None)
     if not url:
         saved = load_config()
         default_url = saved.get("url", "")
@@ -38,8 +53,20 @@ def cmd_login(args: argparse.Namespace) -> int:
 
     clean_url = normalize_moodle_url(url)
 
-    if args.token:
+    if getattr(args, "token", None):
         token = args.token
+    elif getattr(args, "sso", False):
+        console.print(f"Initiating browser SSO login for {clean_url}...")
+        console.print("Waiting for browser callback (timeout 120s)...")
+        try:
+            token, launch_url = login_sso(clean_url)
+            console.print("[green]Token captured successfully from browser callback.[/green]")
+        except Exception as e:
+            err_console.print(f"[red]SSO login failed:[/red] {e}")
+            err_console.print(
+                "You can also provide a manual token with: [bold]open-moodle login --token <YOUR_TOKEN>[/bold]"
+            )
+            return 1
     else:
         username = args.username or input("Username / Student ID: ").strip()
         if not username:
@@ -81,7 +108,7 @@ def cmd_login(args: argparse.Namespace) -> int:
 def cmd_whoami(args: argparse.Namespace) -> int:
     """Show details of the currently authenticated account."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         with MoodleClient(url, token) as client:
             info = client.get_site_info()
             funcs = client.get_available_functions()
@@ -107,7 +134,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 def cmd_courses(args: argparse.Namespace) -> int:
     """List enrolled courses."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         with MoodleClient(url, token) as client:
             courses = client.get_enrolled_courses()
             if not courses:
@@ -135,7 +162,7 @@ def cmd_courses(args: argparse.Namespace) -> int:
 def cmd_deadlines(args: argparse.Namespace) -> int:
     """List upcoming deadlines and calendar events."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         with MoodleClient(url, token) as client:
             events = client.get_upcoming_events(days_ahead=args.days)
             if not events:
@@ -164,7 +191,7 @@ def cmd_deadlines(args: argparse.Namespace) -> int:
 def cmd_announcements(args: argparse.Namespace) -> int:
     """List real teacher announcements from the course Announcements forum."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         with MoodleClient(url, token) as client:
             posts = client.get_course_announcements(course_id=args.course, limit=args.limit)
             if not posts:
@@ -188,7 +215,7 @@ def cmd_announcements(args: argparse.Namespace) -> int:
 def cmd_notifications(args: argparse.Namespace) -> int:
     """List recent announcements and notifications."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         with MoodleClient(url, token) as client:
             notifs = client.get_notifications(limit=args.limit)
             if not notifs:
@@ -212,7 +239,7 @@ def cmd_notifications(args: argparse.Namespace) -> int:
 def cmd_grades(args: argparse.Namespace) -> int:
     """View student grades and scores."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         with MoodleClient(url, token) as client:
             usergrades = client.get_user_grades(course_id=args.course or 0)
             if not usergrades:
@@ -242,7 +269,7 @@ def cmd_grades(args: argparse.Namespace) -> int:
 def cmd_brief(args: argparse.Namespace) -> int:
     """Print a consolidated student briefing for the next N days."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         from open_moodle.server import create_server
         server = create_server(url_override=url, token_override=token)
         tool = next(t for t in server._tool_manager.list_tools() if t.name == "moodle_brief")
@@ -257,7 +284,7 @@ def cmd_brief(args: argparse.Namespace) -> int:
 def cmd_read(args: argparse.Namespace) -> int:
     """Download and extract readable text from a course file URL."""
     try:
-        url, token = get_credentials(args.url, args.token)
+        url, token = _resolve_creds(args)
         with MoodleClient(url, token) as client:
             console.print(f"Downloading {args.file_url} ...")
             data = client.download_file(args.file_url)
@@ -277,17 +304,165 @@ def cmd_read(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_attendance(args: argparse.Namespace) -> int:
+    """Show attendance records and target threshold analysis."""
+    try:
+        url, token = _resolve_creds(args)
+        threshold = float(args.threshold)
+        with MoodleClient(url, token) as client:
+            records = client.get_attendance()
+            if not records:
+                console.print("No attendance records found.")
+                return 0
+
+            total_sessions = sum(r["total_sessions"] for r in records)
+            total_attended = sum(r["attended"] for r in records)
+            overall_pct = (
+                round((total_attended / total_sessions) * 100.0, 2)
+                if total_sessions > 0
+                else 0.0
+            )
+
+            table = Table(title=f"Attendance Report (Target Threshold: {threshold}%)")
+            table.add_column("Course Name", style="bold")
+            table.add_column("Attended", justify="right")
+            table.add_column("Total", justify="right")
+            table.add_column("Percentage", justify="right")
+            table.add_column("Status", justify="center")
+            table.add_column("Safe Bunks / Recovery Needed", justify="left")
+
+            for r in records:
+                m = calculate_attendance_metrics(
+                    r["attended"], r["total_sessions"], threshold=threshold
+                )
+                pct = m["percentage"]
+                if m["status"] == "OK":
+                    status_str = "[green]OK[/green]"
+                    margin_str = (
+                        f"[green]+{m['safe_bunks']} safe bunks[/green]"
+                        if m["safe_bunks"] > 0
+                        else "[dim]On track[/dim]"
+                    )
+                    pct_style = "green"
+                else:
+                    status_str = "[bold red]BELOW TARGET[/bold red]"
+                    margin_str = f"[bold red]Needs {m['recovery_needed']} classes[/bold red]"
+                    pct_style = "bold red"
+
+                table.add_row(
+                    r["course_name"],
+                    str(r["attended"]),
+                    str(r["total_sessions"]),
+                    f"[{pct_style}]{pct}%[/{pct_style}]",
+                    status_str,
+                    margin_str,
+                )
+
+            console.print(table)
+            console.print(
+                f"\n[bold]Overall Aggregate Attendance:[/bold] {total_attended}/{total_sessions} ({overall_pct}%)\n"
+            )
+            return 0
+    except CapabilityError as e:
+        err_console.print(f"[red]Attendance unavailable:[/red] {e}")
+        return 1
+    except Exception as e:
+        err_console.print(f"[red]Error fetching attendance:[/red] {e}")
+        return 1
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Search locally indexed course resources and documents."""
+    results = search_index(
+        query=args.query,
+        course_id=args.course,
+        limit=args.limit,
+    )
+    if not results:
+        scope = f" in course {args.course}" if args.course else ""
+        console.print(f"No matching documents found for '{args.query}'{scope}.")
+        console.print("Tip: Run [bold]open-moodle sync <course_id>[/bold] to index course materials first.")
+        return 0
+
+    table = Table(title=f"Search Results: '{args.query}'")
+    table.add_column("Course", style="dim")
+    table.add_column("File & Location", style="bold")
+    table.add_column("Snippet")
+
+    for r in results:
+        clean_snippet = strip_html(r["snippet"].replace("<b>", "[bold yellow]").replace("</b>", "[/bold yellow]"))
+        table.add_row(
+            r["course_name"],
+            f"{r['filename']}\n({r['page_or_chunk']})",
+            clean_snippet,
+        )
+
+    console.print(table)
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Download and build local full-text search index for a course."""
+    try:
+        url, token = _resolve_creds(args)
+        with MoodleClient(url, token) as client:
+            console.print(f"Indexing course materials for Course ID {args.course}...")
+            res = index_course_materials(client, course_id=args.course)
+            console.print(f"[green]Successfully synced {res['course_name']}:[/green]")
+            console.print(f"  - Newly indexed: {res['indexed']}")
+            console.print(f"  - Already indexed: {res['skipped']}")
+            if res["failed"] > 0:
+                console.print(f"  - Failed / skipped: {res['failed']}")
+            return 0
+    except Exception as e:
+        err_console.print(f"[red]Sync failed:[/red] {e}")
+        return 1
+
+
+def cmd_download(args: argparse.Namespace) -> int:
+    """Bulk download all resource files from a course into structured folders."""
+    try:
+        url, token = _resolve_creds(args)
+        dest = Path(args.dest) if args.dest else Path(f"./course_{args.course}_materials")
+        with MoodleClient(url, token) as client:
+            console.print(f"Downloading course {args.course} into [bold]{dest}[/bold]...")
+
+            def on_progress(fn: str, cur: int, total: int, status: str):
+                if status == "done":
+                    console.print(f"  [{cur}/{total}] [green]Downloaded[/green] {fn}")
+                elif status == "skipped":
+                    console.print(f"  [{cur}/{total}] [dim]Skipped (exists)[/dim] {fn}")
+                elif status == "failed":
+                    console.print(f"  [{cur}/{total}] [red]Failed[/red] {fn}")
+
+            stats = download_course_materials(
+                client,
+                course_id=args.course,
+                dest_dir=dest,
+                progress_callback=on_progress,
+            )
+            mb = round(stats["total_bytes"] / (1024 * 1024), 2)
+            console.print(
+                f"\n[green]Download complete:[/green] {stats['downloaded']} downloaded ({mb} MB), "
+                f"{stats['skipped']} skipped, {stats['failed']} failed."
+            )
+            return 0
+    except Exception as e:
+        err_console.print(f"[red]Download failed:[/red] {e}")
+        return 1
+
+
 def cmd_mcp(args: argparse.Namespace) -> int:
     """Run the Model Context Protocol (MCP) server over stdio."""
-    run_stdio(url_override=args.url, token_override=args.token)
+    run_stdio(url_override=getattr(args, "url", None), token_override=getattr(args, "token", None))
     return 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Main CLI entrypoint."""
     common_parser = argparse.ArgumentParser(add_help=False)
-    common_parser.add_argument("--url", help="Moodle server URL or server.php endpoint")
-    common_parser.add_argument("--token", help="Moodle web service token")
+    common_parser.add_argument("--url", default=argparse.SUPPRESS, help="Moodle server URL or server.php endpoint")
+    common_parser.add_argument("--token", default=argparse.SUPPRESS, help="Moodle web service token")
 
     parser = argparse.ArgumentParser(
         prog="open-moodle",
@@ -304,12 +479,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     # login
     p_login = subparsers.add_parser("login", help="Authenticate with Moodle and save token locally", parents=[common_parser])
     p_login.add_argument("-u", "--username", help="Student ID or username")
+    p_login.add_argument("--sso", action="store_true", help="Authenticate interactively via browser SSO flow")
 
     # whoami
     subparsers.add_parser("whoami", help="Check connection and print student profile", parents=[common_parser])
 
     # courses
     subparsers.add_parser("courses", help="List enrolled courses", parents=[common_parser])
+
+    # attendance
+    p_att = subparsers.add_parser("attendance", help="Show course attendance and safe bunk / recovery analysis", parents=[common_parser])
+    p_att.add_argument("-t", "--threshold", type=float, default=75.0, help="Target attendance percentage threshold (default: 75.0)")
 
     # deadlines
     p_deadlines = subparsers.add_parser("deadlines", help="Show upcoming deadlines and calendar events", parents=[common_parser])
@@ -338,6 +518,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_read.add_argument("-s", "--start", type=int, default=1, help="Starting page or slide (1-indexed)")
     p_read.add_argument("-p", "--pages", type=int, default=20, help="Maximum pages/slides to parse (default: 20)")
 
+    # sync
+    p_sync = subparsers.add_parser("sync", help="Index course materials into local text search index", parents=[common_parser])
+    p_sync.add_argument("course", type=int, help="Numeric Course ID to sync")
+
+    # search
+    p_search = subparsers.add_parser("search", help="Search course documents and slides locally", parents=[common_parser])
+    p_search.add_argument("query", help="Search query string")
+    p_search.add_argument("-c", "--course", type=int, help="Filter search to specific course ID")
+    p_search.add_argument("-n", "--limit", type=int, default=5, help="Maximum snippets to return (default: 5)")
+
+    # download
+    p_dl = subparsers.add_parser("download", help="Bulk download course resources into structured folders", parents=[common_parser])
+    p_dl.add_argument("course", type=int, help="Numeric Course ID to download")
+    p_dl.add_argument("-d", "--dest", help="Destination folder (default: ./course_<ID>_materials)")
+
     args = parser.parse_args(argv)
 
     if not args.command:
@@ -358,6 +553,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         "grades": cmd_grades,
         "brief": cmd_brief,
         "read": cmd_read,
+        "attendance": cmd_attendance,
+        "sync": cmd_sync,
+        "search": cmd_search,
+        "download": cmd_download,
     }
 
     handler = commands.get(args.command)
