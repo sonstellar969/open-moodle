@@ -35,8 +35,41 @@ def test_strip_html():
     assert "<b>" not in stripped
 
 
+def make_test_pdf(text: str = "Operating Systems Sample Page") -> bytes:
+    import pymupdf
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((50, 72), text)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
 def test_extract_plain_text():
     sample = b"Operating Systems Unit 1 Notes\n1. Process Concept\n2. Threads"
     text = extract_content(sample, filename="notes.txt")
     assert "Operating Systems Unit 1 Notes" in text
     assert "1. Process Concept" in text
+
+
+def test_extract_handles_url_with_query_params():
+    pdf_bytes = make_test_pdf("Lecture 1 Introduction")
+    text = extract_content(
+        pdf_bytes,
+        filename="https://lms.college.edu/pluginfile.php/123/file.pdf?forcedownload=1",
+    )
+    assert "# PDF Document" in text
+    assert "Lecture 1 Introduction" in text
+
+
+def test_extract_magic_bytes_without_filename():
+    pdf_bytes = make_test_pdf("Anonymous File Content")
+    text = extract_content(pdf_bytes, filename="")
+    assert "# PDF Document" in text
+    assert "Anonymous File Content" in text
+
+
+def test_extract_corrupted_pdf_handles_gracefully():
+    corrupted = b"%PDF-1.5 this is not valid binary pdf content"
+    text = extract_content(corrupted, filename="corrupted.pdf")
+    assert "[Failed to parse PDF document:" in text

@@ -11,7 +11,11 @@ def parse_pdf(data: bytes, max_pages: int = 50) -> str:
     """Extract plain text from PDF bytes using PyMuPDF."""
     import pymupdf
 
-    doc = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as e:
+        return f"[Failed to parse PDF document: {e}]"
+
     total_pages = len(doc)
     pages_to_read = min(total_pages, max_pages)
 
@@ -42,7 +46,11 @@ def parse_docx(data: bytes) -> str:
     """Extract structured text from DOCX bytes using python-docx."""
     from docx import Document
 
-    doc = Document(io.BytesIO(data))
+    try:
+        doc = Document(io.BytesIO(data))
+    except Exception as e:
+        return f"[Failed to parse Word document: {e}]"
+
     output = []
 
     for para in doc.paragraphs:
@@ -80,7 +88,11 @@ def parse_pptx(data: bytes, max_slides: int = 60) -> str:
     """Extract slide text and tables from PPTX bytes using python-pptx."""
     from pptx import Presentation
 
-    prs = Presentation(io.BytesIO(data))
+    try:
+        prs = Presentation(io.BytesIO(data))
+    except Exception as e:
+        return f"[Failed to parse presentation: {e}]"
+
     total_slides = len(prs.slides)
     slides_to_read = min(total_slides, max_slides)
 
@@ -146,25 +158,46 @@ def extract_content(
     max_pages: int = 50,
 ) -> str:
     """Inspect file signature and name, then route to the appropriate parser."""
-    fn = filename.lower()
+    import urllib.parse
+    import zipfile
+
+    # Extract clean file extension even from URLs with query strings
+    raw_name = filename.split("?")[0].split("#")[0]
+    clean_name = urllib.parse.unquote(raw_name.split("/")[-1]).lower()
     mime = mime_type.lower()
 
-    if fn.endswith(".pdf") or "pdf" in mime:
+    # 1. Magic bytes detection
+    if data.startswith(b"%PDF-"):
         return parse_pdf(data, max_pages=max_pages)
 
-    if fn.endswith(".docx") or "wordprocessingml" in mime:
+    if data.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = zf.namelist()
+                if any("word/document.xml" in n for n in names):
+                    return parse_docx(data)
+                if any("ppt/presentation.xml" in n for n in names):
+                    return parse_pptx(data, max_slides=max_pages)
+        except Exception:
+            pass
+
+    # 2. Filename extension detection
+    if clean_name.endswith(".pdf") or "pdf" in mime:
+        return parse_pdf(data, max_pages=max_pages)
+
+    if clean_name.endswith(".docx") or "wordprocessingml" in mime:
         return parse_docx(data)
 
-    if fn.endswith(".pptx") or "presentationml" in mime:
+    if clean_name.endswith(".pptx") or "presentationml" in mime:
         return parse_pptx(data, max_slides=max_pages)
 
-    if fn.endswith((".txt", ".md", ".py", ".c", ".cpp", ".java", ".json", ".csv", ".yaml", ".yml")):
+    if clean_name.endswith((".txt", ".md", ".py", ".c", ".cpp", ".java", ".json", ".csv", ".yaml", ".yml")):
         return parse_text(data)
 
-    if fn.endswith((".html", ".htm")) or "html" in mime:
+    if clean_name.endswith((".html", ".htm")) or "html" in mime:
         return strip_html(parse_text(data))
 
-    # Fallback to plain text attempt
+    # 3. Fallback to plain text attempt
     try:
         sample = data[:1024].decode("utf-8")
         if sum(1 for c in sample if c.isprintable() or c.isspace()) / max(len(sample), 1) > 0.85:
