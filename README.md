@@ -41,18 +41,27 @@ Connecting AI models to university Moodle portals usually fails due to practical
 
 ## Installation
 
-### Using uv (Recommended)
+### From GitHub (Recommended)
 
-Run directly without manual installation:
+Run or install directly from the repository using `uv` or `pip`:
 
 ```bash
-uvx open-moodle --help
+# Run directly without installing (via uvx)
+uvx --from git+https://github.com/sonstellar969/open-moodle.git open-moodle --help
+
+# Or install globally into your PATH
+uv tool install git+https://github.com/sonstellar969/open-moodle.git
+
+# Or via pip
+pip install git+https://github.com/sonstellar969/open-moodle.git
 ```
 
-### Using pip
+### Local Development / From Source
 
 ```bash
-pip install open-moodle
+git clone https://github.com/sonstellar969/open-moodle.git
+cd open-moodle
+uv tool install --editable .
 ```
 
 ---
@@ -100,8 +109,16 @@ Configure `open-moodle` in your preferred AI assistant.
 
 ### Antigravity CLI (`agy`)
 
+If installed globally via `uv tool install`:
+
 ```bash
-agy mcp add moodle uvx open-moodle mcp
+agy mcp add moodle open-moodle mcp
+```
+
+Or directly from GitHub without installing:
+
+```bash
+agy mcp add moodle uvx --from git+https://github.com/sonstellar969/open-moodle.git open-moodle mcp
 ```
 
 *(If credentials are saved via `open-moodle login`, they are loaded automatically. Otherwise, pass `--env MOODLE_URL=... --env MOODLE_TOKEN=...`.)*
@@ -114,8 +131,8 @@ Add this block to your MCP configuration file (`claude_desktop_config.json`):
 {
   "mcpServers": {
     "moodle": {
-      "command": "uvx",
-      "args": ["open-moodle", "mcp"],
+      "command": "open-moodle",
+      "args": ["mcp"],
       "env": {
         "MOODLE_URL": "https://lms.university.edu/webservice/rest/server.php",
         "MOODLE_TOKEN": "YOUR_MOODLE_TOKEN"
@@ -125,6 +142,8 @@ Add this block to your MCP configuration file (`claude_desktop_config.json`):
 }
 ```
 
+*(Or use `"command": "uvx"` with `"args": ["--from", "git+https://github.com/sonstellar969/open-moodle.git", "open-moodle", "mcp"]`)*
+
 ### Cursor
 
 Add to your project's `.cursor/mcp.json` or configure under **Cursor Settings -> Features -> MCP**:
@@ -133,8 +152,8 @@ Add to your project's `.cursor/mcp.json` or configure under **Cursor Settings ->
 {
   "mcpServers": {
     "moodle": {
-      "command": "uvx",
-      "args": ["open-moodle", "mcp"],
+      "command": "open-moodle",
+      "args": ["mcp"],
       "env": {
         "MOODLE_URL": "https://lms.university.edu/webservice/rest/server.php",
         "MOODLE_TOKEN": "YOUR_MOODLE_TOKEN"
