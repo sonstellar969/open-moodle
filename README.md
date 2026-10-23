@@ -189,76 +189,144 @@ The server exposes 13 tools:
 
 ---
 
-## CLI Usage
+## CLI Commands Reference
 
-### Attendance & Safe Bunk Analytics
+All commands accept global flags `--url <URL>` and `--token <TOKEN>` to override saved credentials or environment variables on the fly.
 
-Calculate safe bunks or sessions needed to reach target percentage:
+### Command Overview
 
-```bash
-open-moodle attendance --threshold 75.0
-```
+| Command | Arguments & Flags | Description |
+|---------|-------------------|-------------|
+| `login` | `[-u USER] [--sso] [--token TOK]` | Authenticates with Moodle and stores credentials in `~/.config/open-moodle/config.json`. |
+| `whoami` | None | Displays authenticated student name, user ID, university site, Moodle version, and whitelisted APIs. |
+| `courses` | None | Lists all enrolled courses with numeric course IDs, short codes, and full course names. |
+| `attendance` | `[-t, --threshold 75.0]` | Displays per-course attendance records with safe bunks allowed or classes needed to hit target percentage. |
+| `brief` | `[-d, --days 7]` | Consolidated student dashboard: active courses, attendance alerts, upcoming deadlines, and unread alerts. |
+| `deadlines` | `[-d, --days 30]` | Lists upcoming actionable calendar deadlines, pending assignment submissions, and quizzes. |
+| `announcements` | `<course_id> [-n, --limit 10]` | Fetches genuine instructor posts and discussion topics from the course Announcements forum. |
+| `notifications` | `[-n, --limit 15]` | Displays recent personal system bell notifications with read/unread statuses. |
+| `grades` | `[-c, --course 0]` | Pulls student grade items, marks, display percentages, grade ranges, and instructor feedback. |
+| `sync` | `<course_id>` | Downloads and indexes course slides, PDFs, Word docs, and notes into local SQLite FTS5 database. |
+| `search` | `<query> [-c COURSE] [-n 5]` | Sub-millisecond BM25 keyword search across locally indexed course slides and notes with excerpts. |
+| `download` | `<course_id> [-d, --dest PATH]` | Bulk downloads all course files into topic folders, automatically skipping unmodified files. |
+| `read` | `<file_url> [-s 1] [-p 20]` | Downloads and extracts readable text directly from a remote file URL with page windowing. |
+| `mcp` | None | Runs the Model Context Protocol (MCP) server over standard input/output (stdio) for AI assistants. |
 
-### Search Course Materials Locally
+---
 
-Index files once, then query without burning context window tokens:
+### Detailed Command Guide
 
-```bash
-# 1. Index course materials into SQLite FTS5
-open-moodle sync 201
+#### 1. `open-moodle login`
+Authenticates with your university's Moodle portal.
 
-# 2. Search for topics across all slides and documents
-open-moodle search "virtual memory" --course 201 --limit 5
-```
+- **Password login**: prompts for URL, student ID, and password, acquiring a token from `/login/token.php`:
+  ```bash
+  open-moodle login
+  ```
+- **Campus SSO login**: opens your default browser to complete Microsoft 365, Google Workspace, or SAML SSO, automatically capturing the token:
+  ```bash
+  open-moodle login --sso
+  ```
+- **Manual token**: save an existing token directly:
+  ```bash
+  open-moodle login --url "https://lms.university.edu" --token "YOUR_TOKEN"
+  ```
 
-### Bulk Download Course Materials
-
-Download all documents and slides organized by syllabus topic:
-
-```bash
-open-moodle download 201 --dest ./OS-Materials
-```
-
-### Student Briefing
-
-```bash
-open-moodle brief --days 7
-```
-
-### Account Metadata
-
+#### 2. `open-moodle whoami`
+Verifies connection and prints student profile metadata:
 ```bash
 open-moodle whoami
 ```
 
-### Course List
-
+#### 3. `open-moodle courses`
+Lists all courses you are enrolled in with their numeric Course IDs (needed for other commands):
 ```bash
 open-moodle courses
 ```
 
-### Deadlines & Calendar
+#### 4. `open-moodle attendance`
+Shows course attendance with target threshold analytics (default 75%):
+```bash
+# Check against standard 75% cutoff
+open-moodle attendance
 
+# Check against custom threshold (e.g., 80% or 85%)
+open-moodle attendance --threshold 80.0
+```
+- For courses $\ge \text{threshold}$: displays safe bunks remaining: $\lfloor \frac{\text{attended} - T \times \text{total}}{T} \rfloor$.
+- For courses $< \text{threshold}$: displays consecutive classes needed to recover: $\lceil \frac{T \times \text{total} - \text{attended}}{1 - T} \rceil$.
+
+#### 5. `open-moodle brief`
+Single-screen student briefing summarizing everything you need to know for the coming week:
+```bash
+open-moodle brief --days 7
+```
+Includes: active course count, attendance danger alerts (<75%), upcoming deadlines, and unread notifications.
+
+#### 6. `open-moodle deadlines`
+Lists actionable calendar events and deadlines:
 ```bash
 open-moodle deadlines --days 14
 ```
 
-### Course Forum Announcements
-
+#### 7. `open-moodle announcements`
+Pulls actual instructor posts from the course Announcements forum (unlike bell notifications, which are generic):
 ```bash
 open-moodle announcements 201 --limit 5
 ```
 
-### Grades & Feedback
-
+#### 8. `open-moodle notifications`
+Lists system bell alerts and personal notices:
 ```bash
+open-moodle notifications --limit 10
+```
+
+#### 9. `open-moodle grades`
+Displays gradebook items, marks, ranges, and teacher feedback:
+```bash
+# View grades across all enrolled courses
+open-moodle grades
+
+# View grades for a specific course ID
 open-moodle grades --course 201
 ```
 
-### Read a Remote File in Terminal
-
+#### 10. `open-moodle sync`
+Downloads and indexes course materials into a local SQLite FTS5 database (`~/.cache/open-moodle/search_index.db`). Once indexed, you can search topics without re-downloading files:
 ```bash
-open-moodle read "https://lms.university.edu/webservice/pluginfile.php/5639/mod_resource/content/1/syllabus.pdf" --start 1 --pages 10
+open-moodle sync 201
+```
+
+#### 11. `open-moodle search`
+Fast local keyword search across all indexed PDFs, slides, and docs with BM25 snippet ranking:
+```bash
+# Search across all indexed courses
+open-moodle search "virtual memory"
+
+# Search within a specific course
+open-moodle search "CPU scheduling" --course 201 --limit 5
+```
+
+#### 12. `open-moodle download`
+Bulk downloads all materials for a course into topic folders (e.g., `01_Syllabus/`, `02_Process_Scheduling/`):
+```bash
+# Downloads into ./course_201_materials by default
+open-moodle download 201
+
+# Downloads into custom directory
+open-moodle download 201 --dest ./OS-Notes
+```
+
+#### 13. `open-moodle read`
+Downloads a remote Moodle file URL and extracts clean readable text in terminal:
+```bash
+open-moodle read "https://lms.university.edu/webservice/pluginfile.php/123/mod_resource/content/1/notes.pdf" --start 1 --pages 10
+```
+
+#### 14. `open-moodle mcp`
+Launches the Model Context Protocol (MCP) stdio server for AI assistants (Antigravity, Claude, Cursor, Grok, Zed):
+```bash
+open-moodle mcp
 ```
 
 ---
