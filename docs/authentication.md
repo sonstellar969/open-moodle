@@ -52,11 +52,26 @@ The `token` value is your API key.
 
 ---
 
-## Method 2: Browser SSO Launch URL (For Microsoft / Google SSO)
+## Method 2: Browser SSO Flow (Automated via CLI or Manual)
 
 When a university enforces Single Sign-On (SSO via Microsoft 365, Google Workspace, or SAML/Shibboleth), `/login/token.php` with direct username/password will reject requests with `invalidlogin`.
 
-Moodle provides a browser-based authentication flow for mobile apps via the `tool_mobile` plugin:
+### Automated CLI Flow
+
+`open-moodle` provides an automated SSO flow:
+
+```bash
+open-moodle login --sso
+```
+
+1. The CLI launches your default web browser to the university's Moodle mobile launch endpoint.
+2. It starts a temporary HTTP listener on `127.0.0.1`.
+3. Complete your institutional SSO in the browser.
+4. Moodle redirects back to localhost, the CLI captures your token automatically, and saves it to `~/.config/open-moodle/config.json`.
+
+### Manual Browser Method (Fallback)
+
+If you are on a remote server without a local browser:
 
 1. Open your browser and navigate to:
    ```
@@ -68,7 +83,7 @@ Moodle provides a browser-based authentication flow for mobile apps via the `too
    moodlemobile://token=TOKEN_VALUE_HERE&privatetoken=...
    ```
 4. If your browser asks to open an external application, inspect the prompt or copy the redirect URL from the address bar or developer console.
-5. Extract the 32-character string following `token=`.
+5. Extract the 32-character string following `token=` (or base64 decode if formatted as passport:::token).
 6. Save it to `open-moodle`:
    ```bash
    open-moodle login --url "https://lms.university.edu" --token "EXTRACTED_TOKEN"

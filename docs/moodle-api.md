@@ -104,11 +104,47 @@ Fetches assignment briefs, submission deadlines, and grading criteria.
 
 ### 6. `message_popup_get_popup_notifications`
 
-Pulls system notifications and announcements delivered to the user.
+Pulls system bell notifications delivered to the user.
 
 **Parameters:**
 - `useridto` (int): Recipient user ID
 - `limit` (int): Batch size
+
+---
+
+### 7. `mod_attendance_get_attendance`
+
+Pulls student attendance sessions, attended count, and percentage per course.
+
+**Parameters:** None (or user ID depending on plugin version)
+
+**Key return fields:**
+- `courses`: Array of courses with `courseid`, `coursename`, `totalsessions`, `attended`, `percentage`
+
+---
+
+### 8. `gradereport_user_get_grade_items`
+
+Pulls student grade items, marks, percentages, and feedback comments.
+
+**Parameters:**
+- `userid` (int): Target user ID
+- `courseid` (int, optional): Filter by course ID
+
+---
+
+### 9. `mod_forum_get_forums_by_courses` & `mod_forum_get_forum_discussions`
+
+Pulls genuine instructor announcements and discussion threads from course news forums.
+
+---
+
+### 10. `mod_assign_get_submission_status`
+
+Checks whether an assignment has been submitted, saved as draft, or untouched, along with grading states.
+
+**Parameters:**
+- `assignid` (int): Target assignment ID
 
 ---
 
