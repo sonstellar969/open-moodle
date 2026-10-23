@@ -28,3 +28,24 @@ def test_cli_courses_routed():
         code = main(["courses", "--url", "https://test.edu", "--token", "tok"])
         assert code == 0
         mock_courses.assert_called_once()
+
+
+def test_cli_announcements_routed():
+    with patch("open_moodle.cli.cmd_announcements", return_value=0) as mock_ann:
+        code = main(["announcements", "201", "--url", "https://test.edu", "--token", "tok"])
+        assert code == 0
+        mock_ann.assert_called_once()
+
+
+def test_cli_grades_routed():
+    with patch("open_moodle.cli.cmd_grades", return_value=0) as mock_grades:
+        code = main(["grades", "--course", "201", "--url", "https://test.edu", "--token", "tok"])
+        assert code == 0
+        mock_grades.assert_called_once()
+
+
+def test_cli_brief_routed():
+    with patch("open_moodle.cli.cmd_brief", return_value=0) as mock_brief:
+        code = main(["brief", "--days", "7", "--url", "https://test.edu", "--token", "tok"])
+        assert code == 0
+        mock_brief.assert_called_once()

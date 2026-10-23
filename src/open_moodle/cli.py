@@ -12,9 +12,9 @@ from rich.table import Table
 
 from open_moodle import __version__
 from open_moodle.auth import AuthenticationError, request_token, verify_credentials
-from open_moodle.client import MoodleAPIError, MoodleClient
+from open_moodle.client import CapabilityError, FileTooLargeError, MoodleAPIError, MoodleClient
 from open_moodle.config import get_credentials, load_config, normalize_moodle_url, save_config
-from open_moodle.parsers import extract_content
+from open_moodle.parsers import extract_content, strip_html
 from open_moodle.server import run_stdio
 
 console = Console()
@@ -84,6 +84,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
         url, token = get_credentials(args.url, args.token)
         with MoodleClient(url, token) as client:
             info = client.get_site_info()
+            funcs = client.get_available_functions()
             table = Table(title="Moodle Account Info", show_header=False)
             table.add_column("Field", style="bold")
             table.add_column("Value")
@@ -94,6 +95,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
             table.add_row("Site Name", info.get("sitename", ""))
             table.add_row("Site URL", info.get("siteurl", ""))
             table.add_row("Moodle Version", info.get("release", ""))
+            table.add_row("Available Functions", f"{len(funcs)} functions whitelisted")
 
             console.print(table)
             return 0
@@ -159,6 +161,30 @@ def cmd_deadlines(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_announcements(args: argparse.Namespace) -> int:
+    """List real teacher announcements from the course Announcements forum."""
+    try:
+        url, token = get_credentials(args.url, args.token)
+        with MoodleClient(url, token) as client:
+            posts = client.get_course_announcements(course_id=args.course, limit=args.limit)
+            if not posts:
+                console.print(f"No forum announcements found for Course ID {args.course}.")
+                return 0
+
+            console.print(f"\n[bold]Course Announcements (Course ID: {args.course})[/bold]\n")
+            for p in posts:
+                title = p.get("name", "Announcement")
+                author = p.get("userfullname", "Instructor")
+                msg = p.get("message", "")
+                console.print(f"[bold cyan]{title}[/bold cyan] — by {author}")
+                if msg:
+                    console.print(f"{strip_html(msg)}\n")
+            return 0
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        return 1
+
+
 def cmd_notifications(args: argparse.Namespace) -> int:
     """List recent announcements and notifications."""
     try:
@@ -183,6 +209,51 @@ def cmd_notifications(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_grades(args: argparse.Namespace) -> int:
+    """View student grades and scores."""
+    try:
+        url, token = get_credentials(args.url, args.token)
+        with MoodleClient(url, token) as client:
+            usergrades = client.get_user_grades(course_id=args.course or 0)
+            if not usergrades:
+                console.print("No grade records found.")
+                return 0
+
+            for ug in usergrades:
+                c_title = ug.get("coursefullname", "Course Grades")
+                table = Table(title=c_title)
+                table.add_column("Assessment Item", style="bold")
+                table.add_column("Grade", style="green")
+                table.add_column("Range", style="dim")
+
+                for item in ug.get("gradeitems", []):
+                    name = item.get("itemname") or item.get("itemtype", "Item")
+                    grade_str = item.get("gradeformatted", "-")
+                    range_str = item.get("rangeformatted", "")
+                    table.add_row(name, grade_str, range_str)
+
+                console.print(table)
+            return 0
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        return 1
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    """Print a consolidated student briefing for the next N days."""
+    try:
+        url, token = get_credentials(args.url, args.token)
+        from open_moodle.server import create_server
+        server = create_server(url_override=url, token_override=token)
+        tool = next(t for t in server._tool_manager.list_tools() if t.name == "moodle_brief")
+        result = tool.fn(days=args.days)
+        console.print(result)
+        return 0
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        return 1
+
+
 def cmd_read(args: argparse.Namespace) -> int:
     """Download and extract readable text from a course file URL."""
     try:
@@ -190,9 +261,17 @@ def cmd_read(args: argparse.Namespace) -> int:
         with MoodleClient(url, token) as client:
             console.print(f"Downloading {args.file_url} ...")
             data = client.download_file(args.file_url)
-            text = extract_content(data, filename=args.file_url, max_pages=args.pages)
+            text = extract_content(
+                data,
+                filename=args.file_url,
+                start_page=args.start,
+                max_pages=args.pages,
+            )
             console.print("\n" + text)
             return 0
+    except FileTooLargeError as e:
+        err_console.print(f"[red]File size limit exceeded:[/red] {e}")
+        return 1
     except Exception as e:
         err_console.print(f"[red]Error reading file:[/red] {e}")
         return 1
@@ -200,7 +279,7 @@ def cmd_read(args: argparse.Namespace) -> int:
 
 def cmd_mcp(args: argparse.Namespace) -> int:
     """Run the Model Context Protocol (MCP) server over stdio."""
-    run_stdio()
+    run_stdio(url_override=args.url, token_override=args.token)
     return 0
 
 
@@ -236,14 +315,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_deadlines = subparsers.add_parser("deadlines", help="Show upcoming deadlines and calendar events", parents=[common_parser])
     p_deadlines.add_argument("-d", "--days", type=int, default=30, help="Days to look ahead (default: 30)")
 
+    # announcements
+    p_ann = subparsers.add_parser("announcements", help="Show course forum announcements", parents=[common_parser])
+    p_ann.add_argument("course", type=int, help="Numeric Course ID")
+    p_ann.add_argument("-n", "--limit", type=int, default=10, help="Number of announcements to fetch")
+
     # notifications
-    p_notifs = subparsers.add_parser("notifications", help="Show recent announcements and alerts", parents=[common_parser])
+    p_notifs = subparsers.add_parser("notifications", help="Show recent system alerts", parents=[common_parser])
     p_notifs.add_argument("-n", "--limit", type=int, default=15, help="Number of items to fetch (default: 15)")
+
+    # grades
+    p_grades = subparsers.add_parser("grades", help="Show grade items and marks", parents=[common_parser])
+    p_grades.add_argument("-c", "--course", type=int, default=0, help="Filter by course ID (default: 0 for all)")
+
+    # brief
+    p_brief = subparsers.add_parser("brief", help="Get a consolidated student briefing", parents=[common_parser])
+    p_brief.add_argument("-d", "--days", type=int, default=7, help="Days to look ahead (default: 7)")
 
     # read
     p_read = subparsers.add_parser("read", help="Download and extract text from a course resource URL", parents=[common_parser])
     p_read.add_argument("file_url", help="Download URL of the resource")
-    p_read.add_argument("-p", "--pages", type=int, default=40, help="Maximum pages/slides to parse")
+    p_read.add_argument("-s", "--start", type=int, default=1, help="Starting page or slide (1-indexed)")
+    p_read.add_argument("-p", "--pages", type=int, default=20, help="Maximum pages/slides to parse (default: 20)")
 
     args = parser.parse_args(argv)
 
@@ -260,7 +353,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         "whoami": cmd_whoami,
         "courses": cmd_courses,
         "deadlines": cmd_deadlines,
+        "announcements": cmd_announcements,
         "notifications": cmd_notifications,
+        "grades": cmd_grades,
+        "brief": cmd_brief,
         "read": cmd_read,
     }
 

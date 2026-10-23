@@ -7,8 +7,8 @@ import re
 from typing import Optional
 
 
-def parse_pdf(data: bytes, max_pages: int = 50) -> str:
-    """Extract plain text from PDF bytes using PyMuPDF."""
+def parse_pdf(data: bytes, start_page: int = 1, max_pages: int = 20) -> str:
+    """Extract plain text from PDF bytes within a page range using PyMuPDF."""
     import pymupdf
 
     try:
@@ -17,12 +17,13 @@ def parse_pdf(data: bytes, max_pages: int = 50) -> str:
         return f"[Failed to parse PDF document: {e}]"
 
     total_pages = len(doc)
-    pages_to_read = min(total_pages, max_pages)
+    start_idx = max(0, start_page - 1)
+    end_idx = min(total_pages, start_idx + max_pages)
 
     output = []
-    output.append(f"# PDF Document ({total_pages} pages total)\n")
+    output.append(f"# PDF Document ({total_pages} pages total, reading pages {start_idx + 1}-{end_idx})\n")
 
-    for i in range(pages_to_read):
+    for i in range(start_idx, end_idx):
         page = doc[i]
         text = page.get_text().strip()
         output.append(f"## Page {i + 1}\n")
@@ -32,10 +33,10 @@ def parse_pdf(data: bytes, max_pages: int = 50) -> str:
             output.append("[No extractable text on this page - likely an image or scan]")
         output.append("\n")
 
-    if total_pages > max_pages:
+    if end_idx < total_pages:
         output.append(
-            f"\n[Note: Document truncated at {max_pages} pages out of {total_pages}. "
-            "Pass a higher page limit to read further.]\n"
+            f"\n[Note: Displaying pages {start_idx + 1}-{end_idx} of {total_pages}. "
+            f"Set start_page={end_idx + 1} to continue reading.]\n"
         )
 
     doc.close()
@@ -84,7 +85,7 @@ def parse_docx(data: bytes) -> str:
     return "\n\n".join(output)
 
 
-def parse_pptx(data: bytes, max_slides: int = 60) -> str:
+def parse_pptx(data: bytes, start_slide: int = 1, max_slides: int = 20) -> str:
     """Extract slide text and tables from PPTX bytes using python-pptx."""
     from pptx import Presentation
 
@@ -94,12 +95,13 @@ def parse_pptx(data: bytes, max_slides: int = 60) -> str:
         return f"[Failed to parse presentation: {e}]"
 
     total_slides = len(prs.slides)
-    slides_to_read = min(total_slides, max_slides)
+    start_idx = max(0, start_slide - 1)
+    end_idx = min(total_slides, start_idx + max_slides)
 
     output = []
-    output.append(f"# Presentation ({total_slides} slides total)\n")
+    output.append(f"# Presentation ({total_slides} slides total, reading slides {start_idx + 1}-{end_idx})\n")
 
-    for i in range(slides_to_read):
+    for i in range(start_idx, end_idx):
         slide = prs.slides[i]
         slide_lines = []
 
@@ -122,9 +124,10 @@ def parse_pptx(data: bytes, max_slides: int = 60) -> str:
             output.append("[Empty slide or graphic-only]")
         output.append("\n")
 
-    if total_slides > max_slides:
+    if end_idx < total_slides:
         output.append(
-            f"\n[Note: Presentation truncated at {max_slides} slides out of {total_slides}.]\n"
+            f"\n[Note: Displaying slides {start_idx + 1}-{end_idx} of {total_slides}. "
+            f"Set start_slide={end_idx + 1} to continue reading.]\n"
         )
 
     return "\n".join(output)
@@ -155,7 +158,8 @@ def extract_content(
     data: bytes,
     filename: str = "",
     mime_type: str = "",
-    max_pages: int = 50,
+    start_page: int = 1,
+    max_pages: int = 20,
 ) -> str:
     """Inspect file signature and name, then route to the appropriate parser."""
     import urllib.parse
@@ -168,7 +172,7 @@ def extract_content(
 
     # 1. Magic bytes detection
     if data.startswith(b"%PDF-"):
-        return parse_pdf(data, max_pages=max_pages)
+        return parse_pdf(data, start_page=start_page, max_pages=max_pages)
 
     if data.startswith(b"PK\x03\x04"):
         try:
@@ -177,19 +181,19 @@ def extract_content(
                 if any("word/document.xml" in n for n in names):
                     return parse_docx(data)
                 if any("ppt/presentation.xml" in n for n in names):
-                    return parse_pptx(data, max_slides=max_pages)
+                    return parse_pptx(data, start_slide=start_page, max_slides=max_pages)
         except Exception:
             pass
 
     # 2. Filename extension detection
     if clean_name.endswith(".pdf") or "pdf" in mime:
-        return parse_pdf(data, max_pages=max_pages)
+        return parse_pdf(data, start_page=start_page, max_pages=max_pages)
 
     if clean_name.endswith(".docx") or "wordprocessingml" in mime:
         return parse_docx(data)
 
     if clean_name.endswith(".pptx") or "presentationml" in mime:
-        return parse_pptx(data, max_slides=max_pages)
+        return parse_pptx(data, start_slide=start_page, max_slides=max_pages)
 
     if clean_name.endswith((".txt", ".md", ".py", ".c", ".cpp", ".java", ".json", ".csv", ".yaml", ".yml")):
         return parse_text(data)

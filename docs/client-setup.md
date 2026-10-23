@@ -2,6 +2,8 @@
 
 This document provides setup instructions for connecting `open-moodle` as an MCP server to various AI tools and coding environments.
 
+If you have already run `open-moodle login` on your local machine, credentials are saved in `~/.config/open-moodle/config.json`. In that case, you do not need to duplicate `MOODLE_URL` or `MOODLE_TOKEN` in the environment variables block unless running in an isolated environment.
+
 ---
 
 ## 1. Antigravity CLI (`agy`)
@@ -25,7 +27,28 @@ agy mcp list
 
 ---
 
-## 2. Claude Desktop
+## 2. Grok / Generic MCP Config
+
+Add `open-moodle` to your MCP configuration JSON:
+
+```json
+{
+  "mcpServers": {
+    "moodle": {
+      "command": "uvx",
+      "args": ["open-moodle", "mcp"],
+      "env": {
+        "MOODLE_URL": "https://lms.university.edu/webservice/rest/server.php",
+        "MOODLE_TOKEN": "YOUR_MOODLE_TOKEN"
+      }
+    }
+  }
+}
+```
+
+---
+
+## 3. Claude Desktop
 
 Locate your Claude Desktop configuration file:
 
@@ -33,7 +56,7 @@ Locate your Claude Desktop configuration file:
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
 
-Add `open-moodle` under the `mcpServers` object:
+Add `open-moodle` under `mcpServers`:
 
 ```json
 {
@@ -54,7 +77,7 @@ Restart Claude Desktop after updating this file.
 
 ---
 
-## 3. Cursor
+## 4. Cursor
 
 Cursor supports MCP servers through its graphical settings or workspace configuration:
 
@@ -87,7 +110,7 @@ Alternatively, add it to your project's `.cursor/mcp.json`:
 
 ---
 
-## 4. Claude Code
+## 5. Claude Code
 
 Run the following command in your terminal:
 
@@ -95,11 +118,11 @@ Run the following command in your terminal:
 claude mcp add moodle -- uvx open-moodle mcp
 ```
 
-Ensure `MOODLE_URL` and `MOODLE_TOKEN` are exported in your current shell or stored via `open-moodle login`.
+Ensure `MOODLE_URL` and `MOODLE_TOKEN` are set or stored via `open-moodle login`.
 
 ---
 
-## 5. Windsurf and Zed
+## 6. Windsurf and Zed
 
 For editors supporting standard stdio MCP servers:
 

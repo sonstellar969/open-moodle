@@ -1,29 +1,35 @@
 # open-moodle
 
-A client and Model Context Protocol (MCP) server for Moodle. It allows AI coding assistants and terminal users to inspect courses, read course materials, track deadlines, and view announcements directly through Moodle's REST API.
+A client and Model Context Protocol (MCP) server for Moodle. It allows AI coding assistants and terminal users to inspect courses, read course materials, track deadlines, check submission status, and view announcements directly through Moodle's REST API.
 
 ---
 
 ## The Problem
 
-Most tools that connect AI models to Moodle encounter two practical obstacles:
+Connecting AI models to university Moodle portals usually fails due to practical design hurdles:
 
-1. **Restricted Token Pages**: Universities often disable `/user/managetoken.php`, preventing students from creating API keys through the web interface.
-2. **Missing Document Parsing**: Existing tools return file URLs instead of reading their contents. Because external AI models cannot access authenticated university networks, they cannot read syllabi, lecture slides, or assignment briefs.
+1. **Restricted Token Pages**: Universities routinely disable `/user/managetoken.php`, preventing students from generating API tokens through the web interface.
+2. **Missing Document Parsing**: Most existing tools only return raw file URLs. External AI models cannot open links behind authenticated intranets, so they cannot read syllabi, lecture slides, or assignment briefs.
+3. **Silent Error Swallowing**: Generic wrappers often catch API exceptions and return empty lists, misleading the assistant into claiming you have no courses, deadlines, or assignments when an API function is merely disabled.
+4. **Token Leakage**: Moodle attaches secret tokens to download links in API responses. Without explicit sanitization, those tokens leak into chat transcripts, system logs, and model context windows.
 
-`open-moodle` addresses both problems:
-- It includes a login helper that obtains active tokens through the standard Moodle mobile authentication endpoint.
-- It downloads and converts PDFs, Word documents, PowerPoint presentations, and code files into plain text before passing them to the AI model.
+`open-moodle` addresses these issues directly:
+- Obtains active tokens via the Moodle mobile authentication endpoint or browser SSO launch flow.
+- Streams and extracts text from PDFs (via PyMuPDF), Word documents (`.docx`), and PowerPoint presentations (`.pptx`) with strict size limits and page windowing.
+- Strips tokens from all output URLs before returning data to the model.
+- Checks whitelisted capabilities and reports informative messages if a university disables a specific endpoint.
 
 ---
 
 ## Features
 
-- **Model Context Protocol Server**: Compatible with Antigravity, Claude Desktop, Cursor, and other MCP clients over standard I/O.
-- **In-Memory Document Extraction**: Converts PDFs (via PyMuPDF), Word `.docx` files, and `.pptx` slide decks directly into text without external dependencies like LibreOffice.
-- **Terminal CLI**: Quick terminal commands to check courses, deadlines, announcements, and download materials without opening a browser.
-- **Credential Storage**: Saves credentials locally in `~/.config/open-moodle/config.json` with restricted user-only permissions (`0600`).
-- **Flexible Environment Support**: Works with `uvx` for zero-install execution or standard `pip`/`pipx` installations.
+- **Model Context Protocol Server**: Compatible with Antigravity, Claude Desktop, Cursor, and Grok over standard I/O (stdio).
+- **In-Memory Document Extraction**: Converts PDFs, Word `.docx`, and PowerPoint `.pptx` slide decks directly into text without external system dependencies like LibreOffice.
+- **Bounded Downloads**: Caps file transfers at 25MB and supports windowed reading (`start_page` and `max_pages`) to protect context windows.
+- **Assignment Submission Status**: Checks whether you turned in each assignment (`submitted`, `draft`, `new`) alongside due dates and grading states.
+- **Course Announcements & Briefing**: Pulls genuine instructor posts from course news forums, and offers a single-call `moodle_brief` tool summarizing deadlines, notifications, and active courses.
+- **Terminal CLI**: Run commands like `open-moodle brief`, `open-moodle courses`, or `open-moodle announcements <course_id>` directly in your shell.
+- **Zero-Install Execution**: Works instantly with `uvx open-moodle` or via standard `pip`/`pipx`.
 
 ---
 
@@ -53,21 +59,21 @@ Run the interactive login command:
 open-moodle login
 ```
 
-You will be prompted for your Moodle site URL, student username, and password. The tool queries `/login/token.php` for a mobile web service token and stores it locally.
+You will be prompted for your Moodle site URL, student username, and password. The tool queries `/login/token.php` for a mobile web service token and stores it locally in `~/.config/open-moodle/config.json` with user-only permissions (`0600`).
 
-If you already have a token:
+If you already have a token or use campus SSO:
 
 ```bash
 open-moodle login --url "https://lms.university.edu" --token "YOUR_TOKEN"
 ```
 
-For detailed troubleshooting on university setups, SSO, or proxying, read the [Authentication Guide](docs/authentication.md).
+For detailed guidance on campus SSO (Microsoft 365, Google Workspace) or mobile app token extraction, read the [Authentication Guide](docs/authentication.md).
 
 ---
 
 ## MCP Server Setup
 
-To connect `open-moodle` to your AI assistant, configure it as an MCP server.
+Configure `open-moodle` in your preferred AI client.
 
 ### Antigravity CLI (`agy`)
 
@@ -78,9 +84,9 @@ agy mcp add \
   moodle uvx open-moodle mcp
 ```
 
-### Claude Desktop
+### Claude Desktop & Grok
 
-Add this block to your `claude_desktop_config.json`:
+Add this block to your MCP configuration file:
 
 ```json
 {
@@ -99,7 +105,7 @@ Add this block to your `claude_desktop_config.json`:
 
 ### Cursor
 
-Add to your project's `.cursor/mcp.json` or configure in Cursor Settings -> Features -> MCP:
+Add to your project's `.cursor/mcp.json` or configure under Cursor Settings -> Features -> MCP:
 
 ```json
 {
@@ -116,7 +122,7 @@ Add to your project's `.cursor/mcp.json` or configure in Cursor Settings -> Feat
 }
 ```
 
-For full instructions covering Claude Code, Windsurf, and Zed, see the [Client Setup Guide](docs/client-setup.md).
+See the [Client Setup Guide](docs/client-setup.md) for full instructions covering Claude Code, Windsurf, and Zed.
 
 ---
 
@@ -124,19 +130,28 @@ For full instructions covering Claude Code, Windsurf, and Zed, see the [Client S
 
 | Tool | Purpose |
 |------|---------|
-| `moodle_whoami` | Checks connection and returns student profile metadata. |
-| `moodle_list_courses` | Returns enrolled courses with IDs and names. |
-| `moodle_get_course_contents` | Lists sections, modules, and resources for a course ID. |
-| `moodle_read_resource` | Downloads and parses a PDF, DOCX, PPTX, or text file into text. |
+| `moodle_brief` | Consolidated student briefing: enrolled courses, deadlines in the next N days, and notifications in one call. |
+| `moodle_whoami` | Checks connection and returns student profile metadata and allowed API count. |
+| `moodle_list_courses` | Returns enrolled courses with numeric IDs, full titles, and short codes. |
+| `moodle_get_course_contents` | Outlines syllabus sections, modules, and resources (with sanitized URLs). |
+| `moodle_read_resource` | Downloads and parses a PDF, DOCX, PPTX, or text file with page range support. |
 | `moodle_upcoming_deadlines` | Returns scheduled quizzes, assignments, and calendar events. |
-| `moodle_notifications` | Fetches announcements and system alerts. |
-| `moodle_get_assignments` | Returns assignment descriptions, submission status, and deadlines. |
+| `moodle_get_assignments` | Lists assignments, due dates, submission states (`Submitted`, `Draft`), and grading status. |
+| `moodle_get_announcements` | Fetches instructor announcements and posts from the course Announcements forum. |
+| `moodle_get_grades` | Pulls grade items, marks, percentages, and teacher feedback. |
+| `moodle_notifications` | Fetches recent system bell alerts and personal notices. |
 
 ---
 
 ## CLI Usage
 
-### Check account status
+### Get a quick student briefing
+
+```bash
+open-moodle brief --days 7
+```
+
+### Check account status and whitelisted APIs
 
 ```bash
 open-moodle whoami
@@ -154,24 +169,30 @@ open-moodle courses
 open-moodle deadlines --days 14
 ```
 
-### View recent announcements
+### View instructor announcements for a course
 
 ```bash
-open-moodle notifications --limit 10
+open-moodle announcements 201 --limit 5
+```
+
+### Check grades
+
+```bash
+open-moodle grades --course 201
 ```
 
 ### Read a course file directly in terminal
 
 ```bash
-open-moodle read "https://lms.university.edu/webservice/pluginfile.php/5639/mod_resource/content/1/syllabus.pdf"
+open-moodle read "https://lms.university.edu/webservice/pluginfile.php/5639/mod_resource/content/1/syllabus.pdf" --start 1 --pages 10
 ```
 
 ---
 
 ## Documentation
 
-- [Authentication & Token Guide](docs/authentication.md): How to get a token when `/user/managetoken.php` is disabled.
-- [Client Setup Guide](docs/client-setup.md): Config examples for Antigravity, Claude, Cursor, and others.
+- [Authentication & Token Guide](docs/authentication.md): Mobile token acquisition, SSO launch flow, and troubleshooting.
+- [Client Setup Guide](docs/client-setup.md): Config examples for Antigravity, Claude, Cursor, Grok, and others.
 - [Moodle API Reference](docs/moodle-api.md): Standard REST web service functions used under the hood.
 
 ---

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import datetime
 from typing import Any, Optional
 
 try:
@@ -10,9 +10,9 @@ try:
 except ImportError:
     from mcp.server.fastmcp import FastMCP as MCPServer
 
-from open_moodle.client import MoodleClient
+from open_moodle.client import CapabilityError, FileTooLargeError, MoodleAPIError, MoodleClient
 from open_moodle.config import get_credentials
-from open_moodle.parsers import extract_content
+from open_moodle.parsers import extract_content, strip_html
 
 
 def create_server(
@@ -31,6 +31,7 @@ def create_server(
         """Get profile information about the authenticated student and institution."""
         with _get_client() as client:
             info = client.get_site_info()
+            funcs = client.get_available_functions()
             lines = [
                 f"Full Name: {info.get('fullname', '')}",
                 f"Username: {info.get('username', '')}",
@@ -38,6 +39,7 @@ def create_server(
                 f"Institution / Site: {info.get('sitename', '')}",
                 f"Moodle URL: {info.get('siteurl', '')}",
                 f"Moodle Release: {info.get('release', '')}",
+                f"Allowed API Functions: {len(funcs)} functions available",
             ]
             return "\n".join(lines)
 
@@ -101,19 +103,33 @@ def create_server(
     def moodle_read_resource(
         file_url: str,
         filename: str = "",
-        max_pages: int = 40,
+        start_page: int = 1,
+        max_pages: int = 20,
     ) -> str:
-        """Download and read the full text content of a PDF, Word document, slide deck, or text file."""
+        """Download and read text content from a PDF, Word document, slide deck, or text file."""
         with _get_client() as client:
-            data = client.download_file(file_url)
-            text = extract_content(data, filename=filename, max_pages=max_pages)
+            try:
+                data = client.download_file(file_url)
+            except FileTooLargeError as e:
+                return f"Download failed: {e}"
+
+            text = extract_content(
+                data,
+                filename=filename or file_url,
+                start_page=start_page,
+                max_pages=max_pages,
+            )
             return text
 
     @server.tool()
     def moodle_upcoming_deadlines(days_ahead: int = 30) -> str:
         """Check for upcoming assignment submissions, quizzes, and calendar events."""
         with _get_client() as client:
-            events = client.get_upcoming_events(days_ahead=days_ahead)
+            try:
+                events = client.get_upcoming_events(days_ahead=days_ahead)
+            except CapabilityError as e:
+                return f"Calendar unavailable: {e}"
+
             if not events:
                 return f"No upcoming deadlines or events in the next {days_ahead} days."
 
@@ -137,12 +153,79 @@ def create_server(
             return "\n".join(output)
 
     @server.tool()
+    def moodle_get_assignments(course_id: int = 0) -> str:
+        """List assignments, submission status, due dates, and grading state."""
+        with _get_client() as client:
+            cids = [course_id] if course_id > 0 else None
+            try:
+                assigns = client.get_assignments(cids, include_submission_status=True)
+            except CapabilityError as e:
+                return f"Assignments API unavailable: {e}"
+
+            if not assigns:
+                return "No assignments found."
+
+            output = ["# Assignments\n"]
+            for a in assigns:
+                title = a.get("name", "Assignment")
+                course = a.get("course_title", "")
+                intro = a.get("intro", "")
+                due = a.get("duedate", 0)
+                sub = a.get("submission", {})
+                status = sub.get("status", "unknown").capitalize()
+                graded = "Graded" if sub.get("graded") else "Not graded"
+
+                output.append(f"## {title}")
+                if course:
+                    output.append(f"- Course: {course}")
+                output.append(f"- Submission Status: **{status}** ({graded})")
+                if due:
+                    dt = datetime.datetime.fromtimestamp(due)
+                    output.append(f"- Due Date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                if intro:
+                    output.append(f"\n{strip_html(intro)}\n")
+
+            return "\n".join(output)
+
+    @server.tool()
+    def moodle_get_announcements(course_id: int, limit: int = 10) -> str:
+        """Fetch actual teacher announcements from the course Announcements forum."""
+        with _get_client() as client:
+            try:
+                posts = client.get_course_announcements(course_id, limit=limit)
+            except CapabilityError as e:
+                return f"Announcements forum unavailable: {e}"
+
+            if not posts:
+                return f"No forum announcements found for Course ID {course_id}."
+
+            output = [f"# Course Announcements (Course ID: {course_id})\n"]
+            for p in posts:
+                name = p.get("name", "Announcement")
+                author = p.get("userfullname", "Instructor")
+                modified = p.get("timemodified", 0)
+                msg = p.get("message", "")
+                date_str = (
+                    datetime.datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M")
+                    if modified
+                    else ""
+                )
+
+                output.append(f"### {name}")
+                output.append(f"- Author: {author} ({date_str})")
+                if msg:
+                    output.append(f"\n{strip_html(msg)}\n")
+                output.append("")
+
+            return "\n".join(output)
+
+    @server.tool()
     def moodle_notifications(limit: int = 15) -> str:
-        """Fetch recent announcements, teacher messages, and grade notifications."""
+        """Fetch recent system bell alerts and personal notifications."""
         with _get_client() as client:
             notifs = client.get_notifications(limit=limit)
             if notifs:
-                output = ["# Recent Notifications\n"]
+                output = ["# Recent System Notifications\n"]
                 for n in notifs:
                     subj = n.get("subject", "Notification")
                     text = n.get("text", n.get("smallmessage", ""))
@@ -162,38 +245,94 @@ def create_server(
             return "No notifications found."
 
     @server.tool()
-    def moodle_get_assignments(course_id: int = 0) -> str:
-        """List assignments, descriptions, and submission deadlines for a course (or all courses if 0)."""
+    def moodle_get_grades(course_id: int = 0) -> str:
+        """Fetch student grades, percentages, and teacher feedback."""
         with _get_client() as client:
-            cids = [course_id] if course_id > 0 else None
-            assigns = client.get_assignments(cids)
-            if not assigns:
-                return "No assignments found."
+            try:
+                usergrades = client.get_user_grades(course_id=course_id)
+            except CapabilityError as e:
+                return f"Grades report unavailable: {e}"
 
-            output = ["# Assignments\n"]
-            for a in assigns:
-                title = a.get("name", "Assignment")
-                course = a.get("course_title", "")
-                intro = a.get("intro", "")
-                due = a.get("duedate", 0)
+            if not usergrades:
+                return "No grade records found."
 
-                output.append(f"## {title}")
-                if course:
-                    output.append(f"- Course: {course}")
-                if due:
-                    import datetime
-                    dt = datetime.datetime.fromtimestamp(due)
-                    output.append(f"- Due Date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                if intro:
-                    from open_moodle.parsers import strip_html
-                    output.append(f"\n{strip_html(intro)}\n")
+            output = ["# Student Grade Report\n"]
+            for ug in usergrades:
+                c_title = ug.get("coursefullname", f"Course {ug.get('courseid')}")
+                output.append(f"## {c_title}\n")
+                items = ug.get("gradeitems", [])
+                for item in items:
+                    name = item.get("itemname") or item.get("itemtype", "Grade item")
+                    grade_str = item.get("gradeformatted", "-")
+                    range_str = item.get("rangeformatted", "")
+                    feedback = item.get("feedback", "")
+
+                    output.append(f"- **{name}**: {grade_str} (Range: {range_str})")
+                    if feedback:
+                        output.append(f"  Feedback: {strip_html(feedback)}")
+                output.append("")
 
             return "\n".join(output)
+
+    @server.tool()
+    def moodle_brief(days: int = 7) -> str:
+        """Consolidated briefing: enrolled courses, deadlines in the next N days, and pending tasks."""
+        with _get_client() as client:
+            lines = [f"# Moodle Student Briefing (Next {days} Days)\n"]
+
+            # 1. Enrolled courses count
+            try:
+                courses = client.get_enrolled_courses()
+                lines.append(f"## Active Courses ({len(courses)})\n")
+                for c in courses[:6]:
+                    lines.append(f"- **{c.get('fullname', '')}** (ID: {c.get('id')})")
+                if len(courses) > 6:
+                    lines.append(f"- _...and {len(courses) - 6} more courses._")
+                lines.append("")
+            except Exception as e:
+                lines.append(f"_Could not load courses: {e}_\n")
+
+            # 2. Upcoming events & deadlines
+            try:
+                events = client.get_upcoming_events(days_ahead=days)
+                lines.append(f"## Upcoming Deadlines & Events ({len(events)})\n")
+                if events:
+                    for ev in events:
+                        name = ev.get("name", "Event")
+                        time_str = ev.get("formattedtime", "")
+                        c_data = ev.get("course", {})
+                        c_name = c_data.get("fullname", "") if isinstance(c_data, dict) else ""
+                        lines.append(f"- **{name}** | {c_name} ({time_str})")
+                else:
+                    lines.append(f"_No deadlines scheduled in the next {days} days._")
+                lines.append("")
+            except Exception as e:
+                lines.append(f"_Could not check deadlines: {e}_\n")
+
+            # 3. Unread notifications
+            try:
+                notifs = client.get_notifications(limit=5)
+                unread = [n for n in notifs if not n.get("read")]
+                lines.append(f"## Recent Notifications ({len(unread)} unread)\n")
+                if notifs:
+                    for n in notifs[:5]:
+                        st = "Unread" if not n.get("read") else "Read"
+                        lines.append(f"- [{st}] **{n.get('subject', 'Notice')}**")
+                else:
+                    lines.append("_No recent notifications._")
+                lines.append("")
+            except Exception as e:
+                lines.append(f"_Could not load notifications: {e}_\n")
+
+            return "\n".join(lines)
 
     return server
 
 
-def run_stdio() -> None:
-    """Run the MCP server over standard input/output."""
-    server = create_server()
+def run_stdio(
+    url_override: Optional[str] = None,
+    token_override: Optional[str] = None,
+) -> None:
+    """Run the MCP server over standard input/output with optional URL and token overrides."""
+    server = create_server(url_override=url_override, token_override=token_override)
     server.run(transport="stdio")
