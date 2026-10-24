@@ -163,15 +163,67 @@ Add to your project's `.cursor/mcp.json` or configure under **Cursor Settings ->
 }
 ```
 
-### Local & Open-Source Models (LM Studio, Continue.dev, Ollama)
+### Local & Open-Source Models (LM Studio, Continue.dev, Ollama, LibreChat)
 
-You can run `open-moodle` with 100% local models (Qwen 2.5, Llama 3.1/3.3, Mistral) to ensure your campus lecture notes, assignments, and grades remain strictly on your machine.
+You can run `open-moodle` with 100% local, open-source models (such as Qwen 2.5, Llama 3.1/3.3, and Mistral) to ensure your campus lecture notes, assignments, attendance, and grades remain strictly on your machine without cloud subscriptions.
 
-- **LM Studio**: Add `"open-moodle": {"command": "open-moodle", "args": ["mcp"]}` to your LM Studio Developer/MCP settings.
-- **Continue.dev (VS Code)**: Add `open-moodle` under `experimental.modelContextProtocolServers` in `~/.continue/config.json`.
-- **Ollama / LibreChat / Open WebUI**: Connect via stdio MCP or custom Python agents.
+#### Recommended Local Models for Tool Calling
+- **Qwen 2.5** (`qwen2.5:7b` / `14b`): Best-in-class precision for function calling on consumer hardware.
+- **Llama 3.1 / 3.3** (`llama3.1:8b` / `70b`): Strong general-purpose reasoning with native tool output.
+- **Mistral Nemo** (`mistral-nemo:12b`): Robust function calling with large context support.
 
-See the complete [Local & Open-Source Models Guide](docs/local-models.md) for full configurations and recommended tool-calling models.
+#### LM Studio Setup
+1. Open **LM Studio** -> navigate to the **Developer / MCP** tab.
+2. Add the server definition:
+   ```json
+   {
+     "mcpServers": {
+       "open-moodle": {
+         "command": "open-moodle",
+         "args": ["mcp"]
+       }
+     }
+   }
+   ```
+3. Load a tool-compatible model (e.g., `qwen2.5-7b-instruct`) and ask: *"Check my attendance"* or *"Search my course notes for virtual memory"*.
+
+#### Continue.dev (VS Code / JetBrains) Setup
+Add `open-moodle` under `experimental.modelContextProtocolServers` in `~/.continue/config.json`:
+```json
+{
+  "models": [
+    {
+      "title": "Ollama - Qwen 2.5 7B",
+      "provider": "ollama",
+      "model": "qwen2.5:7b"
+    }
+  ],
+  "experimental": {
+    "modelContextProtocolServers": [
+      {
+        "transport": {
+          "type": "stdio",
+          "command": "open-moodle",
+          "args": ["mcp"]
+        }
+      }
+    ]
+  }
+}
+```
+
+#### LibreChat Setup
+In your `librechat.yaml`:
+```yaml
+mcpServers:
+  open-moodle:
+    type: stdio
+    command: open-moodle
+    args:
+      - mcp
+```
+
+For advanced usage, Goose CLI agent setup, and custom Python scripts with Ollama, see the [Local Models Guide](docs/local-models.md).
 
 See the [Client Setup Guide](docs/client-setup.md) for instructions covering Claude Code, Windsurf, and Zed.
 
