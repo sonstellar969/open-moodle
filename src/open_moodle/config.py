@@ -55,8 +55,15 @@ def load_config() -> dict[str, str]:
 
 
 def save_config(url: str, token: str, extra: Optional[dict[str, str]] = None) -> None:
-    """Save Moodle credentials to ~/.config/open-moodle/config.json."""
+    """Save Moodle credentials to ~/.config/open-moodle/config.json.
+
+    The file is created with mode 0600 so the token is never written world-readable.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
     payload: dict[str, str] = {
         "url": normalize_moodle_url(url),
         "token": token.strip(),
@@ -64,9 +71,11 @@ def save_config(url: str, token: str, extra: Optional[dict[str, str]] = None) ->
     if extra:
         payload.update(extra)
 
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    # Set permissions so only current user can read credentials
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(CONFIG_FILE, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
     try:
         os.chmod(CONFIG_FILE, 0o600)
     except OSError:

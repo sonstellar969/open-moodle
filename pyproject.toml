@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "open-moodle"
-version = "0.1.0"
+version = "0.1.1"
 description = "Moodle client and Model Context Protocol (MCP) server for AI assistants and terminal use"
 readme = "README.md"
 requires-python = ">=3.10"

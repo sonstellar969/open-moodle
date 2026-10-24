@@ -10,11 +10,39 @@ from open_moodle.downloader import download_course_materials, sanitize_filename
 
 
 def test_sanitize_filename():
-    assert sanitize_filename("Operating: Systems / Unix") == "Operating_ Systems _ Unix"
+    assert sanitize_filename("Operating: Systems") == "Operating_ Systems"
+    assert sanitize_filename("folder/Unix notes.pdf") == "Unix notes.pdf"
+    assert sanitize_filename("..") == "unnamed"
+    assert sanitize_filename("../../etc/passwd") == "passwd"
     assert sanitize_filename("   hello   ") == "hello"
     assert sanitize_filename("") == "unnamed"
     long_name = "a" * 200 + ".pdf"
     assert len(sanitize_filename(long_name, max_length=50)) <= 50
+
+
+def test_download_rejects_parent_directory_name(tmp_path):
+    client = MagicMock()
+    client.get_course_contents.return_value = [
+        {
+            "name": "Lecture",
+            "modules": [
+                {
+                    "contents": [
+                        {
+                            "filename": "..",
+                            "fileurl": "https://example.com/pluginfile.php/x",
+                            "filesize": 4,
+                        }
+                    ]
+                }
+            ],
+        }
+    ]
+    client.download_file.return_value = b"data"
+    dest = tmp_path / "course"
+    download_course_materials(client, course_id=1, dest_dir=dest)
+    assert (dest / "01_Lecture" / "unnamed").read_bytes() == b"data"
+    assert not (tmp_path / "unnamed").exists()
 
 
 def test_download_course_materials_skips_existing(tmp_path):

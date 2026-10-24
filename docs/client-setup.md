@@ -31,7 +31,7 @@ agy mcp list
 
 ---
 
-## 2. Claude Desktop & Grok
+## 2. Claude Desktop
 
 Locate your Claude Desktop configuration file:
 
@@ -57,6 +57,22 @@ Add `open-moodle` under `mcpServers`:
 ```
 
 *(If running without local installation, use `"command": "uvx"` with `"args": ["--from", "git+https://github.com/sonstellar969/open-moodle.git", "open-moodle", "mcp"]`)*.
+
+## Grok
+
+Grok Build stores MCP servers in `~/.grok/config.toml`.
+
+```bash
+grok mcp add moodle -- open-moodle mcp
+```
+
+```toml
+[mcp_servers.moodle]
+command = "open-moodle"
+args = ["mcp"]
+```
+
+Saved credentials from `open-moodle login` are used when those environment variables are omitted.
 
 ---
 

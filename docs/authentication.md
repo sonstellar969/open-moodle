@@ -58,16 +58,16 @@ When a university enforces Single Sign-On (SSO via Microsoft 365, Google Workspa
 
 ### Automated CLI Flow
 
-`open-moodle` provides an automated SSO flow:
-
 ```bash
 open-moodle login --sso
 ```
 
-1. The CLI launches your default web browser to the university's Moodle mobile launch endpoint.
-2. It starts a temporary HTTP listener on `127.0.0.1`.
-3. Complete your institutional SSO in the browser.
-4. Moodle redirects back to localhost, the CLI captures your token automatically, and saves it to `~/.config/open-moodle/config.json`.
+Moodle's launch endpoint only accepts a custom URL scheme. It rejects an `http://127.0.0.1` callback. The command therefore:
+
+1. Opens `admin/tool/mobile/launch.php` with `urlscheme=openmoodle` and `confirmed=1`.
+2. Registers a temporary `openmoodle://` handler that forwards the link to a localhost listener, then removes the handler.
+3. Checks that the payload starts with `md5(wwwroot + passport)` and keeps the web service token (the second `:::` field, not the private token).
+4. If the handler does not fire, paste the `openmoodle://token=...` link from the Moodle page into the terminal.
 
 ### Manual Browser Method (Fallback)
 
@@ -80,10 +80,11 @@ If you are on a remote server without a local browser:
 2. Log in through your campus SSO provider (Microsoft/Google).
 3. Upon successful login, the browser attempts to redirect to a custom protocol URL:
    ```
-   moodlemobile://token=TOKEN_VALUE_HERE&privatetoken=...
+   moodlemobile://token=BASE64_VALUE
    ```
-4. If your browser asks to open an external application, inspect the prompt or copy the redirect URL from the address bar or developer console.
-5. Extract the 32-character string following `token=` (or base64 decode if formatted as passport:::token).
+   The base64 value decodes to `md5(wwwroot + passport):::WEB_SERVICE_TOKEN` and may end with `:::PRIVATE_TOKEN`. The web service token is the middle field.
+4. If your browser asks to open an external application, copy that URL from the prompt or the page link.
+5. Save the 32-character web service token:
 6. Save it to `open-moodle`:
    ```bash
    open-moodle login --url "https://lms.university.edu" --token "EXTRACTED_TOKEN"

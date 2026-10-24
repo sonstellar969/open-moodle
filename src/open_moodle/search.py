@@ -9,15 +9,15 @@ import sqlite3
 import time
 from typing import Any, Optional
 
-from open_moodle.client import FileTooLargeError, MoodleClient
+import urllib.parse
+
+from open_moodle.client import FileTooLargeError, MoodleClient, redact_secrets, strip_token_from_url
 from open_moodle.parsers import extract_content
 
 SUPPORTED_EXTENSIONS = {
     ".pdf",
     ".docx",
-    ".doc",
     ".pptx",
-    ".ppt",
     ".txt",
     ".md",
     ".py",
@@ -28,6 +28,19 @@ SUPPORTED_EXTENSIONS = {
     ".html",
     ".json",
 }
+# Legacy OLE files are not parsed. Indexing their error text would pollute search.
+LEGACY_EXTENSIONS = {".doc", ".ppt"}
+SCHEMA_VERSION = "2"
+# snippet() column index for `content` in the FTS5 table below.
+_CONTENT_COLUMN = 7
+
+
+def _restrict_private(path: Path) -> None:
+    """Best-effort owner-only permissions for the cache directory and database."""
+    try:
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    except OSError:
+        pass
 
 
 def get_default_db_path() -> Path:
@@ -39,6 +52,7 @@ def get_default_db_path() -> Path:
         base = Path.home() / ".cache"
     dir_path = base / "open-moodle"
     dir_path.mkdir(parents=True, exist_ok=True)
+    _restrict_private(dir_path)
     return dir_path / "search_index.db"
 
 
@@ -46,14 +60,32 @@ def init_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
     """Initialize SQLite FTS5 database tables and return connection."""
     path = db_path or get_default_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    _restrict_private(path.parent)
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+    """)
+    current = conn.execute(
+        "SELECT value FROM index_meta WHERE key = 'schema'"
+    ).fetchone()
+    if current is None or current[0] != SCHEMA_VERSION:
+        conn.execute("DROP TABLE IF EXISTS file_chunks")
+        conn.execute("DROP TABLE IF EXISTS indexed_files")
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema', ?)",
+            (SCHEMA_VERSION,),
+        )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS indexed_files (
             file_key TEXT PRIMARY KEY,
             course_id INTEGER,
             filename TEXT,
+            file_url TEXT,
             timemodified INTEGER,
             filesize INTEGER,
             indexed_at REAL
@@ -61,16 +93,23 @@ def init_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
     """)
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS file_chunks USING fts5(
+            file_key UNINDEXED,
             course_id UNINDEXED,
             course_name,
             module_name,
             filename,
+            file_url UNINDEXED,
             page_or_chunk,
             content,
             tokenize='porter unicode61'
         );
     """)
     conn.commit()
+    _restrict_private(path)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(path) + suffix)
+        if sidecar.exists():
+            _restrict_private(sidecar)
     return conn
 
 
@@ -90,8 +129,11 @@ def split_text_into_chunks(text: str, max_chunk_chars: int = 1500) -> list[tuple
     if not text.strip():
         return []
 
-    # Check if text contains explicit page/slide delimiters
-    page_splits = list(re.finditer(r"---\s*(Page|Slide)\s*(\d+)\s*---", text, re.IGNORECASE))
+    # Parsers emit "## Page N" / "## Slide N". Older callers used "--- Page N ---".
+    page_splits = list(re.finditer(
+        r"(?im)^(?:---\s*)?#{0,3}\s*(Page|Slide)\s+(\d+)\s*(?:---)?\s*$",
+        text,
+    ))
     if page_splits:
         chunks: list[tuple[str, str]] = []
         for i, match in enumerate(page_splits):
@@ -154,6 +196,10 @@ def index_course_materials(
     indexed_count = 0
     skipped_count = 0
     failed_count = 0
+    removed_count = 0
+    unsupported_count = 0
+    errors: list[str] = []
+    seen: set[str] = set()
 
     for section in contents:
         sec_name = section.get("name", "General")
@@ -169,56 +215,74 @@ def index_course_materials(
                     continue
 
                 ext = Path(filename).suffix.lower()
+                if ext in LEGACY_EXTENSIONS:
+                    unsupported_count += 1
+                    errors.append(f"{filename}: legacy {ext} is not indexed")
+                    continue
                 if ext not in SUPPORTED_EXTENSIONS:
                     continue
 
-                file_key = f"{course_id}_{filename}_{timemodified}"
+                file_key = _file_key(course_id, file_url)
+                seen.add(file_key)
+                safe_url = strip_token_from_url(file_url)
 
-                # Check if file was already indexed
                 cur = conn.execute(
-                    "SELECT 1 FROM indexed_files WHERE file_key = ?",
+                    "SELECT timemodified FROM indexed_files WHERE file_key = ?",
                     (file_key,),
                 )
-                if cur.fetchone():
+                existing = cur.fetchone()
+                if existing and int(existing[0] or 0) == int(timemodified or 0):
                     skipped_count += 1
                     continue
 
-                # Download and extract
                 try:
                     raw_data = client.download_file(file_url, max_bytes=max_file_size)
-                    text = extract_content(raw_data, filename)
+                    text = extract_content(raw_data, filename, max_pages=None)
+                    if text.startswith("[Failed") or text.startswith("[Binary"):
+                        failed_count += 1
+                        errors.append(f"{filename}: {text.splitlines()[0][:180]}")
+                        continue
                     chunks = split_text_into_chunks(text)
 
-                    # Delete any previous version of chunks for this file
-                    conn.execute(
-                        "DELETE FROM file_chunks WHERE course_id = ? AND filename = ?",
-                        (course_id, filename),
-                    )
-
-                    # Insert new chunks into FTS5
+                    conn.execute("DELETE FROM file_chunks WHERE file_key = ?", (file_key,))
                     for label, chunk_text in chunks:
                         conn.execute(
                             """
-                            INSERT INTO file_chunks (course_id, course_name, module_name, filename, page_or_chunk, content)
-                            VALUES (?, ?, ?, ?, ?, ?)
+                            INSERT INTO file_chunks (
+                                file_key, course_id, course_name, module_name,
+                                filename, file_url, page_or_chunk, content
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             """,
-                            (course_id, course_name, mod_name, filename, label, chunk_text),
+                            (file_key, str(course_id), course_name, mod_name, filename, safe_url, label, chunk_text),
                         )
 
-                    # Mark file as indexed
                     conn.execute(
                         """
-                        INSERT OR REPLACE INTO indexed_files (file_key, course_id, filename, timemodified, filesize, indexed_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO indexed_files (
+                            file_key, course_id, filename, file_url, timemodified, filesize, indexed_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (file_key, course_id, filename, timemodified, filesize, time.time()),
+                        (file_key, course_id, filename, safe_url, timemodified, filesize, time.time()),
                     )
                     conn.commit()
                     indexed_count += 1
-                except (FileTooLargeError, Exception):
+                except (FileTooLargeError, Exception) as exc:
                     failed_count += 1
+                    errors.append(f"{filename}: {redact_secrets(str(exc))[:180]}")
                     continue
 
+    stale = conn.execute(
+        "SELECT file_key FROM indexed_files WHERE course_id = ?",
+        (course_id,),
+    ).fetchall()
+    for (stale_key,) in stale:
+        if stale_key not in seen:
+            conn.execute("DELETE FROM file_chunks WHERE file_key = ?", (stale_key,))
+            conn.execute("DELETE FROM indexed_files WHERE file_key = ?", (stale_key,))
+            removed_count += 1
+    conn.commit()
     conn.close()
     return {
         "course_id": course_id,
@@ -226,7 +290,17 @@ def index_course_materials(
         "indexed": indexed_count,
         "skipped": skipped_count,
         "failed": failed_count,
+        "removed": removed_count,
+        "unsupported": unsupported_count,
+        "errors": errors[:8],
     }
+
+
+def _file_key(course_id: int, file_url: str) -> str:
+    """Stable identity for one resource, ignoring token query parameters."""
+    clean = strip_token_from_url(file_url)
+    parsed = urllib.parse.urlsplit(clean)
+    return f"{course_id}|{parsed.netloc.lower()}|{parsed.path}"
 
 
 def search_index(
@@ -246,14 +320,15 @@ def search_index(
         conn.close()
         return []
 
-    sql = """
+    sql = f"""
         SELECT
             course_id,
             course_name,
             module_name,
             filename,
+            file_url,
             page_or_chunk,
-            snippet(file_chunks, 5, '<b>', '</b>', '...', 28) AS matched_snippet,
+            snippet(file_chunks, {_CONTENT_COLUMN}, '<b>', '</b>', '...', 28) AS matched_snippet,
             bm25(file_chunks) AS score
         FROM file_chunks
         WHERE file_chunks MATCH ?
@@ -262,7 +337,7 @@ def search_index(
 
     if course_id:
         sql += " AND course_id = ?"
-        params.append(course_id)
+        params.append(str(course_id))
 
     sql += " ORDER BY score ASC LIMIT ?"
     params.append(limit)
@@ -278,9 +353,10 @@ def search_index(
             "course_name": r[1],
             "module_name": r[2],
             "filename": r[3],
-            "page_or_chunk": r[4],
-            "snippet": r[5],
-            "score": r[6],
+            "file_url": r[4],
+            "page_or_chunk": r[5],
+            "snippet": r[6],
+            "score": r[7],
         })
     return results
 
@@ -292,7 +368,7 @@ def clear_course_index(course_id: int, db_path: Optional[Path] = None) -> int:
         return 0
 
     conn = sqlite3.connect(str(path))
-    conn.execute("DELETE FROM file_chunks WHERE course_id = ?", (course_id,))
+    conn.execute("DELETE FROM file_chunks WHERE course_id = ?", (str(course_id),))
     cur = conn.execute("DELETE FROM indexed_files WHERE course_id = ?", (course_id,))
     deleted = cur.rowcount
     conn.commit()

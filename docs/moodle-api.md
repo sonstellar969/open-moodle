@@ -112,14 +112,11 @@ Pulls system bell notifications delivered to the user.
 
 ---
 
-### 7. `mod_attendance_get_attendance`
+### 7. Attendance
 
-Pulls student attendance sessions, attended count, and percentage per course.
+`open-moodle` does not call `mod_attendance_get_sessions`. That function exists on the attendance plugin and requires a teacher capability (`mod/attendance:manageattendances`, `takeattendances`, or `changeattendances`). It does not return the current student's tally.
 
-**Parameters:** None (or user ID depending on plugin version)
-
-**Key return fields:**
-- `courses`: Array of courses with `courseid`, `coursename`, `totalsessions`, `attended`, `percentage`
+Student attendance is read from `gradereport_user_get_grade_items`. Items whose name contains "attendance" are shown as percentages. Point values are not treated as session counts, and safe-bunk math stays off unless a record actually includes `attended` and `total_sessions`.
 
 ---
 

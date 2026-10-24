@@ -16,15 +16,16 @@ from open_moodle.auth import AuthenticationError, login_sso, request_token, veri
 from open_moodle.client import (
     CapabilityError,
     FileTooLargeError,
-    MoodleAPIError,
     MoodleClient,
-    calculate_attendance_metrics,
+    UnsafeDownloadError,
+    format_attendance_detail,
+    redact_secrets,
 )
 from open_moodle.config import get_credentials, load_config, normalize_moodle_url, save_config
 from open_moodle.downloader import download_course_materials
 from open_moodle.parsers import extract_content, strip_html
 from open_moodle.search import index_course_materials, search_index
-from open_moodle.server import run_stdio
+from open_moodle.server import render_brief, run_stdio
 
 console = Console()
 err_console = Console(stderr=True)
@@ -62,7 +63,7 @@ def cmd_login(args: argparse.Namespace) -> int:
             token, launch_url = login_sso(clean_url)
             console.print("[green]Token captured successfully from browser callback.[/green]")
         except Exception as e:
-            err_console.print(f"[red]SSO login failed:[/red] {e}")
+            err_console.print(f"[red]SSO login failed:[/red] {redact_secrets(str(e))}")
             err_console.print(
                 "You can also provide a manual token with: [bold]open-moodle login --token <YOUR_TOKEN>[/bold]"
             )
@@ -84,7 +85,7 @@ def cmd_login(args: argparse.Namespace) -> int:
             token = res["token"]
             console.print("[green]Token acquired successfully.[/green]")
         except AuthenticationError as e:
-            err_console.print(f"[red]Authentication failed:[/red] {e}")
+            err_console.print(f"[red]Authentication failed:[/red] {redact_secrets(str(e))}")
             err_console.print(
                 "\nIf your college uses SSO (Microsoft/Google) or blocks mobile web services,\n"
                 "you can provide an existing token with: [bold]open-moodle login --token <YOUR_TOKEN>[/bold]"
@@ -101,7 +102,7 @@ def cmd_login(args: argparse.Namespace) -> int:
         console.print("Credentials saved to ~/.config/open-moodle/config.json\n")
         return 0
     except AuthenticationError as e:
-        err_console.print(f"[red]Verification failed:[/red] {e}")
+        err_console.print(f"[red]Verification failed:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -127,7 +128,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
             console.print(table)
             return 0
     except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -155,7 +156,7 @@ def cmd_courses(args: argparse.Namespace) -> int:
             console.print(table)
             return 0
     except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -184,7 +185,7 @@ def cmd_deadlines(args: argparse.Namespace) -> int:
             console.print(table)
             return 0
     except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -205,10 +206,10 @@ def cmd_announcements(args: argparse.Namespace) -> int:
                 msg = p.get("message", "")
                 console.print(f"[bold cyan]{title}[/bold cyan] — by {author}")
                 if msg:
-                    console.print(f"{strip_html(msg)}\n")
+                    console.print(f"{redact_secrets(strip_html(msg))}\n")
             return 0
     except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -229,10 +230,10 @@ def cmd_notifications(args: argparse.Namespace) -> int:
                 status = "[green]Read[/green]" if n.get("read") else "[bold red]Unread[/bold red]"
                 console.print(f"\n[bold]{subj}[/bold] ({status} - {when})")
                 if text:
-                    console.print(f"  {text}")
+                    console.print(f"  {redact_secrets(text)}")
             return 0
     except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -262,7 +263,7 @@ def cmd_grades(args: argparse.Namespace) -> int:
                 console.print(table)
             return 0
     except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -270,14 +271,23 @@ def cmd_brief(args: argparse.Namespace) -> int:
     """Print a consolidated student briefing for the next N days."""
     try:
         url, token = _resolve_creds(args)
-        from open_moodle.server import create_server
-        server = create_server(url_override=url, token_override=token)
-        tool = next(t for t in server._tool_manager.list_tools() if t.name == "moodle_brief")
-        result = tool.fn(days=args.days)
-        console.print(result)
+        with MoodleClient(url, token) as client:
+            console.print(render_brief(client, days=args.days))
         return 0
     except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
+        return 1
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Show which Moodle web services this token can call."""
+    try:
+        url, token = _resolve_creds(args)
+        with MoodleClient(url, token) as client:
+            console.print(client.describe_capabilities())
+        return 0
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -296,11 +306,11 @@ def cmd_read(args: argparse.Namespace) -> int:
             )
             console.print("\n" + text)
             return 0
-    except FileTooLargeError as e:
-        err_console.print(f"[red]File size limit exceeded:[/red] {e}")
+    except (FileTooLargeError, UnsafeDownloadError) as e:
+        err_console.print(f"[red]Download refused:[/red] {redact_secrets(str(e))}")
         return 1
     except Exception as e:
-        err_console.print(f"[red]Error reading file:[/red] {e}")
+        err_console.print(f"[red]Error reading file:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -315,59 +325,41 @@ def cmd_attendance(args: argparse.Namespace) -> int:
                 console.print("No attendance records found.")
                 return 0
 
-            total_sessions = sum(r["total_sessions"] for r in records)
-            total_attended = sum(r["attended"] for r in records)
-            overall_pct = (
-                round((total_attended / total_sessions) * 100.0, 2)
-                if total_sessions > 0
-                else 0.0
-            )
-
             table = Table(title=f"Attendance Report (Target Threshold: {threshold}%)")
             table.add_column("Course Name", style="bold")
-            table.add_column("Attended", justify="right")
-            table.add_column("Total", justify="right")
+            table.add_column("Item")
             table.add_column("Percentage", justify="right")
             table.add_column("Status", justify="center")
-            table.add_column("Safe Bunks / Recovery Needed", justify="left")
+            table.add_column("Detail")
 
-            for r in records:
-                m = calculate_attendance_metrics(
-                    r["attended"], r["total_sessions"], threshold=threshold
-                )
-                pct = m["percentage"]
-                if m["status"] == "OK":
+            for record in records:
+                detail = format_attendance_detail(record, threshold=threshold)
+                pct = detail["percentage"]
+                if detail["status"] == "OK":
                     status_str = "[green]OK[/green]"
-                    margin_str = (
-                        f"[green]+{m['safe_bunks']} safe bunks[/green]"
-                        if m["safe_bunks"] > 0
-                        else "[dim]On track[/dim]"
-                    )
                     pct_style = "green"
                 else:
                     status_str = "[bold red]BELOW TARGET[/bold red]"
-                    margin_str = f"[bold red]Needs {m['recovery_needed']} classes[/bold red]"
                     pct_style = "bold red"
-
                 table.add_row(
-                    r["course_name"],
-                    str(r["attended"]),
-                    str(r["total_sessions"]),
+                    record["course_name"],
+                    str(record.get("item_name") or ""),
                     f"[{pct_style}]{pct}%[/{pct_style}]",
                     status_str,
-                    margin_str,
+                    detail["detail"],
                 )
 
             console.print(table)
             console.print(
-                f"\n[bold]Overall Aggregate Attendance:[/bold] {total_attended}/{total_sessions} ({overall_pct}%)\n"
+                "\n[dim]Gradebook percentages are not session counts. "
+                "Safe bunks appear only when attended and total sessions are known.[/dim]\n"
             )
             return 0
     except CapabilityError as e:
-        err_console.print(f"[red]Attendance unavailable:[/red] {e}")
+        err_console.print(f"[red]Attendance unavailable:[/red] {redact_secrets(str(e))}")
         return 1
     except Exception as e:
-        err_console.print(f"[red]Error fetching attendance:[/red] {e}")
+        err_console.print(f"[red]Error fetching attendance:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -391,9 +383,12 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     for r in results:
         clean_snippet = strip_html(r["snippet"].replace("<b>", "[bold yellow]").replace("</b>", "[/bold yellow]"))
+        location = f"{r['filename']}\n({r['page_or_chunk']})"
+        if r.get("file_url"):
+            location += f"\n{r['file_url']}"
         table.add_row(
             r["course_name"],
-            f"{r['filename']}\n({r['page_or_chunk']})",
+            location,
             clean_snippet,
         )
 
@@ -408,14 +403,19 @@ def cmd_sync(args: argparse.Namespace) -> int:
         with MoodleClient(url, token) as client:
             console.print(f"Indexing course materials for Course ID {args.course}...")
             res = index_course_materials(client, course_id=args.course)
-            console.print(f"[green]Successfully synced {res['course_name']}:[/green]")
+            console.print(f"[green]Synced {res['course_name']}:[/green]")
             console.print(f"  - Newly indexed: {res['indexed']}")
             console.print(f"  - Already indexed: {res['skipped']}")
+            console.print(f"  - Removed: {res.get('removed', 0)}")
+            if res.get("unsupported"):
+                console.print(f"  - Legacy .doc/.ppt skipped: {res['unsupported']}")
             if res["failed"] > 0:
-                console.print(f"  - Failed / skipped: {res['failed']}")
+                console.print(f"  - Failed: {res['failed']}")
+            for err in res.get("errors") or []:
+                console.print(f"  - [yellow]{err}[/yellow]")
             return 0
     except Exception as e:
-        err_console.print(f"[red]Sync failed:[/red] {e}")
+        err_console.print(f"[red]Sync failed:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -446,9 +446,11 @@ def cmd_download(args: argparse.Namespace) -> int:
                 f"\n[green]Download complete:[/green] {stats['downloaded']} downloaded ({mb} MB), "
                 f"{stats['skipped']} skipped, {stats['failed']} failed."
             )
+            for err in stats.get("errors") or []:
+                console.print(f"  - [yellow]{err}[/yellow]")
             return 0
     except Exception as e:
-        err_console.print(f"[red]Download failed:[/red] {e}")
+        err_console.print(f"[red]Download failed:[/red] {redact_secrets(str(e))}")
         return 1
 
 
@@ -512,6 +514,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_brief = subparsers.add_parser("brief", help="Get a consolidated student briefing", parents=[common_parser])
     p_brief.add_argument("-d", "--days", type=int, default=7, help="Days to look ahead (default: 7)")
 
+    # doctor
+    subparsers.add_parser("doctor", help="Show which Moodle web services this token can call", parents=[common_parser])
+
     # read
     p_read = subparsers.add_parser("read", help="Download and extract text from a course resource URL", parents=[common_parser])
     p_read.add_argument("file_url", help="Download URL of the resource")
@@ -552,6 +557,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "notifications": cmd_notifications,
         "grades": cmd_grades,
         "brief": cmd_brief,
+        "doctor": cmd_doctor,
         "read": cmd_read,
         "attendance": cmd_attendance,
         "sync": cmd_sync,

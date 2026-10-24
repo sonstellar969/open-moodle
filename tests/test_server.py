@@ -22,6 +22,7 @@ def test_server_tools_registered():
         "moodle_get_attendance",
         "moodle_search",
         "moodle_sync_course",
+        "moodle_doctor",
     ]
     for tool_name in expected_tools:
         assert tool_name in tools, f"Missing tool: {tool_name}"

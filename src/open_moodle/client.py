@@ -4,14 +4,49 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 import urllib.parse
 import httpx
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
 from open_moodle.config import get_base_url, normalize_moodle_url
+
+_TOKEN_IN_TEXT = re.compile(r"(?i)\b(token|wstoken)=([^&\s\"']+)")
+_REDACT_INSTALLED = False
+
+
+class _RedactTokenFilter(logging.Filter):
+    """Drop token values from log lines emitted by HTTP libraries."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_secrets(record.msg)
+        if record.args:
+            record.args = tuple(
+                redact_secrets(arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
+
+
+def install_log_redaction() -> None:
+    """Attach a token redaction filter without changing global log levels."""
+    global _REDACT_INSTALLED
+    if _REDACT_INSTALLED:
+        return
+    token_filter = _RedactTokenFilter()
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).addFilter(token_filter)
+    _REDACT_INSTALLED = True
+
+
+def redact_secrets(text: str) -> str:
+    """Replace token query values so secrets do not land in output or logs."""
+    if not text:
+        return ""
+    return _TOKEN_IN_TEXT.sub(r"\1=REDACTED", text)
 
 
 class MoodleAPIError(Exception):
@@ -33,6 +68,11 @@ class FileTooLargeError(Exception):
     pass
 
 
+class UnsafeDownloadError(Exception):
+    """Raised when a download URL is outside this Moodle site."""
+    pass
+
+
 def calculate_attendance_metrics(attended: int, total: int, threshold: float = 75.0) -> dict[str, Any]:
     """Calculate attendance percentage, safe bunks, or classes needed to hit target threshold."""
     if total <= 0:
@@ -41,6 +81,7 @@ def calculate_attendance_metrics(attended: int, total: int, threshold: float = 7
             "status": "OK",
             "safe_bunks": 0,
             "recovery_needed": 0,
+            "recovery_possible": True,
         }
 
     pct = round((attended / total) * 100.0, 2)
@@ -57,19 +98,91 @@ def calculate_attendance_metrics(attended: int, total: int, threshold: float = 7
             "status": "OK",
             "safe_bunks": max(0, safe),
             "recovery_needed": 0,
+            "recovery_possible": True,
         }
-    else:
-        # Minimum consecutive sessions a student must attend: (attended + m) / (total + m) >= t_ratio
-        if t_ratio < 1.0:
-            needed = math.ceil(((t_ratio * total) - attended) / (1.0 - t_ratio))
-        else:
-            needed = 0
+
+    # A 100% target is unreachable once any session has already been missed.
+    if t_ratio >= 1.0:
         return {
             "percentage": pct,
             "status": "BELOW TARGET",
             "safe_bunks": 0,
-            "recovery_needed": max(0, needed),
+            "recovery_needed": None,
+            "recovery_possible": False,
         }
+
+    needed = math.ceil(((t_ratio * total) - attended) / (1.0 - t_ratio))
+    return {
+        "percentage": pct,
+        "status": "BELOW TARGET",
+        "safe_bunks": 0,
+        "recovery_needed": max(0, needed),
+        "recovery_possible": True,
+    }
+
+
+def _grade_percentage(item: dict[str, Any]) -> Optional[float]:
+    """Read a grade item's percentage without treating points as session counts."""
+    raw_text = str(item.get("percentageformatted") or "").replace("%", "").replace(",", "").strip()
+    if raw_text and raw_text not in {"-", "–"}:
+        try:
+            return round(float(raw_text), 2)
+        except ValueError:
+            pass
+    raw = item.get("graderaw")
+    maximum = item.get("grademax")
+    try:
+        if raw is not None and maximum not in (None, 0, "0"):
+            return round((float(raw) / float(maximum)) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return None
+
+
+def format_attendance_detail(record: dict[str, Any], threshold: float = 75.0) -> dict[str, Any]:
+    """Describe one attendance row for CLI and MCP output.
+
+    Session math runs only when attended and total_sessions are real counts.
+    Gradebook rows compare the percentage with the threshold and say why bunks
+    are omitted.
+    """
+    if record.get("sessions_known") and record.get("total_sessions"):
+        metrics = calculate_attendance_metrics(
+            int(record["attended"]),
+            int(record["total_sessions"]),
+            threshold=threshold,
+        )
+        if metrics["status"] == "OK":
+            if metrics["safe_bunks"] > 0:
+                detail = f"+{metrics['safe_bunks']} safe bunks"
+            else:
+                detail = "On track"
+        elif not metrics["recovery_possible"]:
+            detail = "Cannot reach this target after a missed session"
+        else:
+            detail = f"Needs {metrics['recovery_needed']} classes"
+        return {
+            "percentage": metrics["percentage"],
+            "status": metrics["status"],
+            "detail": detail,
+            "metrics": metrics,
+        }
+
+    percentage = record.get("percentage")
+    if percentage is None:
+        return {
+            "percentage": None,
+            "status": "UNKNOWN",
+            "detail": "No percentage available",
+            "metrics": None,
+        }
+    status = "OK" if float(percentage) >= threshold else "BELOW TARGET"
+    return {
+        "percentage": percentage,
+        "status": status,
+        "detail": "Gradebook percentage. Session counts are unavailable, so safe bunks are not calculated.",
+        "metrics": None,
+    }
 
 
 def strip_token_from_url(url: str) -> str:
@@ -127,7 +240,12 @@ class MoodleClient:
         self._user_id: Optional[int] = None
         self._site_info: Optional[dict[str, Any]] = None
         self._available_functions: Optional[set[str]] = None
-        self._http = httpx.Client(timeout=timeout, follow_redirects=True)
+        install_log_redaction()
+        self._http = httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": "open-moodle (Python)"},
+        )
 
     def close(self) -> None:
         """Close the underlying HTTP client session."""
@@ -184,7 +302,7 @@ class MoodleClient:
         result = response.json()
         if isinstance(result, dict) and result.get("exception"):
             raise MoodleAPIError(
-                message=result.get("message", "Unknown Moodle error"),
+                message=redact_secrets(str(result.get("message", "Unknown Moodle error"))),
                 errorcode=result.get("errorcode", ""),
                 exception=result.get("exception", ""),
             )
@@ -227,12 +345,11 @@ class MoodleClient:
             if isinstance(data, dict) and "courses" in data:
                 return data["courses"]
 
-        if "core_course_get_courses_by_field" in funcs:
-            data = self.call("core_course_get_courses_by_field", {"field": "id", "value": ""})
-            if isinstance(data, dict) and "courses" in data:
-                return data["courses"]
-
-        raise CapabilityError("No supported course listing function is enabled for this Moodle account.")
+        raise CapabilityError(
+            "No supported course listing function is enabled for this Moodle account. "
+            "Need core_enrol_get_users_courses or "
+            "core_course_get_enrolled_courses_by_timeline_classification."
+        )
 
     def get_course_contents(self, course_id: int) -> list[dict[str, Any]]:
         """Fetch the full hierarchical contents of a course with sanitized file URLs."""
@@ -337,11 +454,16 @@ class MoodleClient:
             for assign in course_entry.get("assignments", []):
                 assign["course_title"] = c_title
                 assign["course_id"] = c_id
+                all_assignments.append(assign)
 
-                if include_submission_status and "id" in assign:
+        if include_submission_status and all_assignments:
+            def _attach(assign: dict[str, Any]) -> None:
+                if "id" in assign:
                     assign["submission"] = self.get_submission_status(assign["id"])
 
-                all_assignments.append(assign)
+            workers = min(4, len(all_assignments))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_attach, all_assignments))
 
         return all_assignments
 
@@ -414,92 +536,158 @@ class MoodleClient:
             return res["notifications"]
         return []
 
+    def _allowed_download_url(self, file_url: str) -> str:
+        """Return a URL only when it is a pluginfile on this Moodle host."""
+        parsed = urllib.parse.urlsplit(file_url.strip())
+        site = urllib.parse.urlsplit(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise UnsafeDownloadError("Refusing a file URL that is not http(s).")
+        if parsed.hostname is None or parsed.hostname.lower() != (site.hostname or "").lower():
+            raise UnsafeDownloadError(
+                "Refusing to download a file from a host other than the configured Moodle site. "
+                "That request would have sent your token to the other host."
+            )
+        if parsed.port != site.port and not (
+            parsed.port in (None, 80, 443) and site.port in (None, 80, 443)
+        ):
+            raise UnsafeDownloadError("Refusing a file URL on a different port than the Moodle site.")
+        if "pluginfile.php" not in parsed.path:
+            raise UnsafeDownloadError(
+                "Refusing a file URL that is not a Moodle pluginfile.php path."
+            )
+        return urllib.parse.urlunsplit(parsed)
+
     def download_file(self, file_url: str, max_bytes: int = 25 * 1024 * 1024) -> bytes:
-        """Download a file with streaming and a strict byte limit.
+        """Download a pluginfile with streaming and a strict byte limit.
 
-        Appends ?token=... to the request URL if absent, but keeps the token
-        confined to this internal method.
+        The token is appended only after the URL is checked against this site.
+        It stays inside this method and is stripped from raised errors.
         """
-        target_url = file_url
-        if "token=" not in target_url:
-            separator = "&" if "?" in target_url else "?"
-            target_url = f"{target_url}{separator}token={self.token}"
+        checked = self._allowed_download_url(file_url)
+        parsed = urllib.parse.urlsplit(checked)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(key.lower() in ("token", "wstoken") for key, _ in query):
+            query.append(("token", self.token))
+        target_url = urllib.parse.urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query),
+            "",
+        ))
 
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "User-Agent": "open-moodle/0.1.0 (Python)",
-        }
+        try:
+            with self._http.stream("GET", target_url) as res:
+                res.raise_for_status()
+                content = bytearray()
+                for chunk in res.iter_bytes(chunk_size=65536):
+                    content.extend(chunk)
+                    if len(content) > max_bytes:
+                        limit_mb = max_bytes // (1024 * 1024)
+                        raise FileTooLargeError(
+                            f"File exceeds maximum download size limit of {limit_mb}MB."
+                        )
+                return bytes(content)
+        except UnsafeDownloadError:
+            raise
+        except FileTooLargeError:
+            raise
+        except httpx.HTTPError as exc:
+            raise MoodleAPIError(redact_secrets(str(exc))) from None
 
-        with self._http.stream("GET", target_url, headers=headers) as res:
-            res.raise_for_status()
-            content = bytearray()
-            for chunk in res.iter_bytes(chunk_size=65536):
-                content.extend(chunk)
-                if len(content) > max_bytes:
-                    limit_mb = max_bytes // (1024 * 1024)
-                    raise FileTooLargeError(
-                        f"File exceeds maximum download size limit of {limit_mb}MB."
-                    )
-            return bytes(content)
+    def describe_capabilities(self) -> str:
+        """Report which student features this token's web service allows."""
+        funcs = self.get_available_functions()
+        info = self._site_info or {}
+        checks = [
+            ("Courses", [
+                "core_enrol_get_users_courses",
+                "core_course_get_enrolled_courses_by_timeline_classification",
+            ]),
+            ("Course contents", ["core_course_get_contents"]),
+            ("Calendar", [
+                "core_calendar_get_action_events_by_timesort",
+                "core_calendar_get_calendar_events",
+            ]),
+            ("Assignments", ["mod_assign_get_assignments"]),
+            ("Submission status", ["mod_assign_get_submission_status"]),
+            ("Grades", ["gradereport_user_get_grade_items"]),
+            ("Forums", [
+                "mod_forum_get_forums_by_courses",
+                "mod_forum_get_forum_discussions",
+            ]),
+            ("Notifications", ["message_popup_get_popup_notifications"]),
+            ("Attendance sessions", ["mod_attendance_get_sessions"]),
+        ]
+        lines = [
+            f"Site: {info.get('sitename', '')}",
+            f"User: {info.get('fullname', '')} (id {info.get('userid', '')})",
+            f"Whitelisted functions: {len(funcs)}",
+            "",
+        ]
+        for label, names in checks:
+            enabled = [name for name in names if name in funcs]
+            if enabled:
+                lines.append(f"[available] {label}: {', '.join(enabled)}")
+            else:
+                lines.append(f"[missing]   {label}: none of {', '.join(names)}")
+        lines.append("")
+        if "mod_attendance_get_sessions" in funcs:
+            lines.append(
+                "Attendance sessions are listed for this token. That Moodle function "
+                "requires a teacher capability, so student marks still come from the gradebook."
+            )
+        else:
+            lines.append(
+                "Student tokens do not include a session register. Attendance percentages "
+                "come from gradebook items whose name contains 'attendance'. "
+                "Safe-bunk math needs real session counts and stays off."
+            )
+        return "\n".join(lines)
 
     def get_attendance(self) -> list[dict[str, Any]]:
-        """Fetch attendance records across enrolled courses.
+        """Fetch attendance as gradebook percentages.
 
-        First attempts mod_attendance_get_attendance. If unavailable, inspects
-        course grade items for attendance entries as a fallback.
+        The attendance plugin's web services (mod_attendance_get_sessions and
+        friends) are teacher functions. They do not return the current student's
+        session tally. Grade items are reported as percentages only. Point values
+        are not treated as classes held or classes attended.
         """
         funcs = self.get_available_functions()
+        if "gradereport_user_get_grade_items" not in funcs:
+            raise CapabilityError(
+                "Grade report API (gradereport_user_get_grade_items) is not enabled, "
+                "and student tokens cannot read the attendance session register."
+            )
 
-        if "mod_attendance_get_attendance" in funcs:
-            res = self.call("mod_attendance_get_attendance")
-            if isinstance(res, dict) and "courses" in res:
-                records = []
-                for item in res["courses"]:
-                    total = int(item.get("totalsessions", 0))
-                    attended = int(item.get("attended", 0))
-                    pct_raw = item.get("percentage", 0.0)
-                    try:
-                        pct = float(pct_raw)
-                    except (ValueError, TypeError):
-                        pct = round((attended / total * 100.0), 2) if total > 0 else 0.0
+        user_grades = self.get_user_grades()
+        records: list[dict[str, Any]] = []
+        for ug in user_grades:
+            c_id = ug.get("courseid", 0)
+            course_name = ug.get("coursefullname") or f"Course {c_id}"
+            for item in ug.get("gradeitems", []):
+                item_name = item.get("itemname") or ""
+                if "attendance" not in item_name.lower():
+                    continue
+                percentage = _grade_percentage(item)
+                if percentage is None:
+                    continue
+                records.append({
+                    "course_id": c_id,
+                    "course_name": course_name,
+                    "item_name": item_name,
+                    "percentage": percentage,
+                    "attended": None,
+                    "total_sessions": None,
+                    "sessions_known": False,
+                    "source": "gradebook",
+                })
 
-                    records.append({
-                        "course_id": item.get("courseid", 0),
-                        "course_name": item.get("coursename", "Unknown Course"),
-                        "total_sessions": total,
-                        "attended": attended,
-                        "percentage": pct,
-                    })
-                return records
+        if records:
+            return records
 
-        if "gradereport_user_get_grade_items" in funcs:
-            try:
-                user_grades = self.get_user_grades()
-                records = []
-                for ug in user_grades:
-                    c_id = ug.get("courseid", 0)
-                    for item in ug.get("gradeitems", []):
-                        item_name = item.get("itemname") or ""
-                        if "attendance" in item_name.lower():
-                            raw = item.get("graderaw")
-                            max_val = item.get("grademax")
-                            pct_str = str(item.get("percentageformatted") or "")
-                            pct_clean = pct_str.replace("%", "").strip()
-                            try:
-                                pct = float(pct_clean)
-                            except ValueError:
-                                pct = 0.0
-                            records.append({
-                                "course_id": c_id,
-                                "course_name": item.get("coursename") or f"Course {c_id}",
-                                "total_sessions": int(max_val) if max_val is not None else 0,
-                                "attended": int(raw) if raw is not None else 0,
-                                "percentage": pct,
-                            })
-                if records:
-                    return records
-            except Exception:
-                pass
-
-        raise CapabilityError("Attendance tracking functions (mod_attendance_get_attendance) are not enabled on this Moodle server.")
+        raise CapabilityError(
+            "No gradebook item named attendance was found. "
+            "Session counts are not available to this student token, so safe bunks cannot be calculated."
+        )
 

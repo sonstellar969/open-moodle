@@ -15,7 +15,10 @@ from open_moodle.client import (
     FileTooLargeError,
     MoodleAPIError,
     MoodleClient,
-    calculate_attendance_metrics,
+    UnsafeDownloadError,
+    format_attendance_detail,
+    redact_secrets,
+    strip_token_from_url,
 )
 from open_moodle.config import get_credentials
 from open_moodle.parsers import extract_content, strip_html
@@ -117,8 +120,8 @@ def create_server(
         with _get_client() as client:
             try:
                 data = client.download_file(file_url)
-            except FileTooLargeError as e:
-                return f"Download failed: {e}"
+            except (FileTooLargeError, UnsafeDownloadError, MoodleAPIError) as e:
+                return f"Download failed: {redact_secrets(str(e))}"
 
             text = extract_content(
                 data,
@@ -146,7 +149,7 @@ def create_server(
                 time_str = ev.get("formattedtime", "")
                 c_data = ev.get("course", {})
                 c_name = c_data.get("fullname", "") if isinstance(c_data, dict) else ""
-                url = ev.get("url", "")
+                url = strip_token_from_url(ev.get("url") or "")
 
                 output.append(f"- **{name}**")
                 if c_name:
@@ -190,7 +193,7 @@ def create_server(
                     dt = datetime.datetime.fromtimestamp(due)
                     output.append(f"- Due Date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 if intro:
-                    output.append(f"\n{strip_html(intro)}\n")
+                    output.append(f"\n{redact_secrets(strip_html(intro))}\n")
 
             return "\n".join(output)
 
@@ -221,7 +224,7 @@ def create_server(
                 output.append(f"### {name}")
                 output.append(f"- Author: {author} ({date_str})")
                 if msg:
-                    output.append(f"\n{strip_html(msg)}\n")
+                    output.append(f"\n{redact_secrets(strip_html(msg))}\n")
                 output.append("")
 
             return "\n".join(output)
@@ -238,13 +241,13 @@ def create_server(
                     text = n.get("text", n.get("smallmessage", ""))
                     when = n.get("timecreatedpretty", "")
                     read_status = "Read" if n.get("read") else "Unread"
-                    url = n.get("contexturl", "")
+                    url = strip_token_from_url(n.get("contexturl") or "")
 
                     output.append(f"### {subj} [{read_status}]")
                     if when:
                         output.append(f"_Received: {when}_")
                     if text:
-                        output.append(text)
+                        output.append(redact_secrets(text))
                     if url:
                         output.append(f"Link: {url}")
                     output.append("")
@@ -276,14 +279,14 @@ def create_server(
 
                     output.append(f"- **{name}**: {grade_str} (Range: {range_str})")
                     if feedback:
-                        output.append(f"  Feedback: {strip_html(feedback)}")
+                        output.append(f"  Feedback: {redact_secrets(strip_html(feedback))}")
                 output.append("")
 
             return "\n".join(output)
 
     @server.tool()
     def moodle_get_attendance(threshold: float = 75.0) -> str:
-        """Fetch attendance records across enrolled courses with 75% threshold analytics."""
+        """Fetch gradebook attendance percentages. Session bunks are included only when counts exist."""
         with _get_client() as client:
             try:
                 records = client.get_attendance()
@@ -293,42 +296,21 @@ def create_server(
             if not records:
                 return "No attendance records found."
 
-            total_sessions = sum(r["total_sessions"] for r in records)
-            total_attended = sum(r["attended"] for r in records)
-            overall_pct = (
-                round((total_attended / total_sessions) * 100.0, 2)
-                if total_sessions > 0
-                else 0.0
-            )
-
             output = [
                 f"# Attendance Summary (Target: {threshold}%)\n",
-                f"**Overall Attendance**: {total_attended}/{total_sessions} ({overall_pct}%)\n",
-                "| Course | Attended | Total | % | Status | Safe Bunks / Needed |",
-                "|---|---|---|---|---|---|",
+                "Rows come from gradebook items named attendance, unless a record includes real session counts.",
+                "",
+                "| Course | Item | % | Status | Detail |",
+                "|---|---|---|---|---|",
             ]
-
-            for r in records:
-                metrics = calculate_attendance_metrics(
-                    r["attended"], r["total_sessions"], threshold=threshold
+            for record in records:
+                detail = format_attendance_detail(record, threshold=threshold)
+                pct = detail["percentage"]
+                pct_text = f"{pct}%" if pct is not None else "—"
+                output.append(
+                    f"| {record['course_name']} | {record.get('item_name', '')} | "
+                    f"{pct_text} | {detail['status']} | {detail['detail']} |"
                 )
-                c_name = r["course_name"]
-                att = r["attended"]
-                tot = r["total_sessions"]
-                pct = metrics["percentage"]
-                st = metrics["status"]
-
-                if metrics["status"] == "OK":
-                    margin = (
-                        f"+{metrics['safe_bunks']} safe bunks"
-                        if metrics["safe_bunks"] > 0
-                        else "On track"
-                    )
-                else:
-                    margin = f"⚠️ Needs {metrics['recovery_needed']} classes"
-
-                output.append(f"| {c_name} | {att} | {tot} | {pct}% | {st} | {margin} |")
-
             return "\n".join(output)
 
     @server.tool()
@@ -351,7 +333,10 @@ def create_server(
 
             output.append(f"### {f_name} ({loc})")
             output.append(f"- **Course**: {c_name}")
-            output.append(f"- **Excerpt**: {snip}\n")
+            file_url = r.get("file_url") or ""
+            if file_url:
+                output.append(f"- **File URL**: {strip_token_from_url(file_url)}")
+            output.append(f"- **Excerpt**: {redact_secrets(snip)}\n")
 
         return "\n".join(output)
 
@@ -360,87 +345,100 @@ def create_server(
         """Download and index all text documents for a course into local SQLite FTS5 index."""
         with _get_client() as client:
             res = index_course_materials(client, course_id=course_id)
-            return (
-                f"Course {res['course_name']} (ID: {course_id}) synced successfully.\n"
-                f"- Indexed new documents: {res['indexed']}\n"
-                f"- Already up to date: {res['skipped']}\n"
-                f"- Failed / non-parseable: {res['failed']}"
-            )
+            lines = [
+                f"Course {res['course_name']} (ID: {course_id}) synced.",
+                f"- Indexed new documents: {res['indexed']}",
+                f"- Already up to date: {res['skipped']}",
+                f"- Removed from index: {res.get('removed', 0)}",
+                f"- Legacy .doc/.ppt skipped: {res.get('unsupported', 0)}",
+                f"- Failed: {res['failed']}",
+            ]
+            for err in res.get("errors") or []:
+                lines.append(f"- {err}")
+            return "\n".join(lines)
+
+    @server.tool()
+    def moodle_doctor() -> str:
+        """Show which Moodle web service functions this token can use."""
+        with _get_client() as client:
+            return client.describe_capabilities()
 
     @server.tool()
     def moodle_brief(days: int = 7) -> str:
         """Consolidated briefing: enrolled courses, deadlines in the next N days, and pending tasks."""
         with _get_client() as client:
-            lines = [f"# Moodle Student Briefing (Next {days} Days)\n"]
-
-            # 1. Enrolled courses count
-            try:
-                courses = client.get_enrolled_courses()
-                lines.append(f"## Active Courses ({len(courses)})\n")
-                for c in courses[:6]:
-                    lines.append(f"- **{c.get('fullname', '')}** (ID: {c.get('id')})")
-                if len(courses) > 6:
-                    lines.append(f"- _...and {len(courses) - 6} more courses._")
-                lines.append("")
-            except Exception as e:
-                lines.append(f"_Could not load courses: {e}_\n")
-
-            # 2. Attendance alerts
-            try:
-                att_records = client.get_attendance()
-                if att_records:
-                    at_risk = []
-                    for r in att_records:
-                        m = calculate_attendance_metrics(r["attended"], r["total_sessions"], threshold=75.0)
-                        if m["status"] == "BELOW TARGET":
-                            at_risk.append((r["course_name"], r["attended"], r["total_sessions"], m["percentage"], m["recovery_needed"]))
-
-                    lines.append(f"## Attendance Status\n")
-                    if at_risk:
-                        lines.append("⚠️ **Courses Below 75% Cutoff:**")
-                        for name, att, tot, pct, needed in at_risk:
-                            lines.append(f"- **{name}**: {att}/{tot} ({pct}%) — Needs **{needed}** consecutive sessions")
-                    else:
-                        lines.append("✅ All courses meeting 75% attendance threshold.")
-                    lines.append("")
-            except Exception:
-                pass
-
-            # 3. Upcoming events & deadlines
-            try:
-                events = client.get_upcoming_events(days_ahead=days)
-                lines.append(f"## Upcoming Deadlines & Events ({len(events)})\n")
-                if events:
-                    for ev in events:
-                        name = ev.get("name", "Event")
-                        time_str = ev.get("formattedtime", "")
-                        c_data = ev.get("course", {})
-                        c_name = c_data.get("fullname", "") if isinstance(c_data, dict) else ""
-                        lines.append(f"- **{name}** | {c_name} ({time_str})")
-                else:
-                    lines.append(f"_No deadlines scheduled in the next {days} days._")
-                lines.append("")
-            except Exception as e:
-                lines.append(f"_Could not check deadlines: {e}_\n")
-
-            # 4. Unread notifications
-            try:
-                notifs = client.get_notifications(limit=5)
-                unread = [n for n in notifs if not n.get("read")]
-                lines.append(f"## Recent Notifications ({len(unread)} unread)\n")
-                if notifs:
-                    for n in notifs[:5]:
-                        st = "Unread" if not n.get("read") else "Read"
-                        lines.append(f"- [{st}] **{n.get('subject', 'Notice')}**")
-                else:
-                    lines.append("_No recent notifications._")
-                lines.append("")
-            except Exception as e:
-                lines.append(f"_Could not load notifications: {e}_\n")
-
-            return "\n".join(lines)
+            return render_brief(client, days=days)
 
     return server
+
+
+def render_brief(client: MoodleClient, days: int = 7) -> str:
+    """Build the student briefing from an already authenticated client."""
+    lines = [f"# Moodle Student Briefing (Next {days} Days)\n"]
+
+    try:
+        courses = client.get_enrolled_courses()
+        lines.append(f"## Active Courses ({len(courses)})\n")
+        for course in courses[:6]:
+            lines.append(f"- **{course.get('fullname', '')}** (ID: {course.get('id')})")
+        if len(courses) > 6:
+            lines.append(f"- _...and {len(courses) - 6} more courses._")
+        lines.append("")
+    except Exception as exc:
+        lines.append(f"_Could not load courses: {redact_secrets(str(exc))}_\n")
+
+    try:
+        records = client.get_attendance()
+        lines.append("## Attendance Status\n")
+        below = []
+        for record in records:
+            detail = format_attendance_detail(record, threshold=75.0)
+            if detail["status"] == "BELOW TARGET":
+                below.append((record, detail))
+        if below:
+            lines.append("Courses below 75%:")
+            for record, detail in below:
+                label = record.get("item_name") or record["course_name"]
+                lines.append(
+                    f"- **{record['course_name']}** ({label}): {detail['percentage']}% — {detail['detail']}"
+                )
+        else:
+            lines.append("Every attendance row is at or above 75%.")
+        lines.append("")
+    except Exception as exc:
+        lines.append(f"_Could not load attendance: {redact_secrets(str(exc))}_\n")
+
+    try:
+        events = client.get_upcoming_events(days_ahead=days)
+        lines.append(f"## Upcoming Deadlines & Events ({len(events)})\n")
+        if events:
+            for ev in events:
+                name = ev.get("name", "Event")
+                time_str = ev.get("formattedtime", "")
+                c_data = ev.get("course", {})
+                c_name = c_data.get("fullname", "") if isinstance(c_data, dict) else ""
+                lines.append(f"- **{name}** | {c_name} ({time_str})")
+        else:
+            lines.append(f"_No deadlines scheduled in the next {days} days._")
+        lines.append("")
+    except Exception as exc:
+        lines.append(f"_Could not check deadlines: {redact_secrets(str(exc))}_\n")
+
+    try:
+        notifs = client.get_notifications(limit=5)
+        unread = [n for n in notifs if not n.get("read")]
+        lines.append(f"## Recent Notifications ({len(unread)} unread)\n")
+        if notifs:
+            for n in notifs[:5]:
+                st = "Unread" if not n.get("read") else "Read"
+                lines.append(f"- [{st}] **{n.get('subject', 'Notice')}**")
+        else:
+            lines.append("_No recent notifications._")
+        lines.append("")
+    except Exception as exc:
+        lines.append(f"_Could not load notifications: {redact_secrets(str(exc))}_\n")
+
+    return "\n".join(lines)
 
 
 def run_stdio(

@@ -58,6 +58,15 @@ def test_get_credentials_via_env():
         assert token == "env_token"
 
 
+def test_save_config_is_owner_readable(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr("open_moodle.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("open_moodle.config.CONFIG_FILE", cfg)
+    save_config("https://lms.edu", "sekret")
+    assert cfg.stat().st_mode & 0o777 == 0o600
+    assert "sekret" in cfg.read_text(encoding="utf-8")
+
+
 def test_get_credentials_missing_raises():
     with patch.dict(os.environ, {}, clear=True):
         with patch("open_moodle.config.load_config", return_value={}):

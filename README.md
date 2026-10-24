@@ -18,7 +18,7 @@ Connecting AI models to university Moodle portals usually fails due to practical
 - Obtains active tokens via the Moodle mobile authentication endpoint or browser-assisted SSO launch flow.
 - Indexes course documents locally into an embedded SQLite FTS5 full-text search engine for sub-second keyword lookups without re-downloading files into model context.
 - Streams and extracts text from PDFs (via PyMuPDF), Word documents (`.docx`), and PowerPoint presentations (`.pptx`) with strict size limits and page windowing.
-- Strips tokens from all output URLs before returning data to the model.
+- Strips `token` and `wstoken` from course, calendar, notification, and search URLs, and from error text, before returning data to the model. File downloads are limited to this site's `pluginfile.php`.
 - Checks whitelisted capabilities and reports informative messages if a university disables a specific endpoint.
 
 ---
@@ -26,14 +26,14 @@ Connecting AI models to university Moodle portals usually fails due to practical
 ## Features
 
 - **Model Context Protocol Server**: Compatible with Antigravity (`agy`), Claude Desktop, Cursor, Grok, and Zed over standard input/output (stdio).
-- **Attendance & Threshold Analytics**: Calculates per-course attendance percentages, safe bunks remaining while staying above a target cutoff (e.g., 75%), or consecutive classes needed to recover from below the threshold.
-- **Zero-Dependency Local Search**: Embedded SQLite FTS5 index allows sub-second keyword search across course PDFs, slides, and docs with BM25 snippet ranking without external vector databases.
+- **Attendance from the gradebook**: Reads grade items named attendance and compares them with your cutoff. Safe-bunk and recovery math runs only when real session counts are present. Student tokens cannot read the attendance plugin's session register.
+- **Local full-text search**: Embedded SQLite FTS5 index gives sub-second BM25 keyword search across course PDFs, slides, and docs. No separate search server. Indexing stores every page, not a 20-page window.
 - **Bulk Course Downloader**: Downloads course files organized into topic directories, skipping unmodified files automatically.
 - **In-Memory Document Extraction**: Converts PDFs, Word `.docx`, and PowerPoint `.pptx` slide decks directly into text without external system dependencies like LibreOffice.
 - **Bounded Downloads**: Caps file transfers at 25MB and supports windowed reading (`start_page` and `max_pages`) to protect context windows.
 - **Assignment Submission Status**: Checks whether you turned in each assignment (`submitted`, `draft`, `new`) alongside due dates and grading states.
 - **Course Announcements & Briefing**: Pulls genuine instructor posts from course news forums, and offers a single-call `moodle_brief` tool summarizing deadlines, attendance alerts, notifications, and active courses.
-- **Interactive Browser SSO**: One-command browser login flow for campus SSO portals (Microsoft 365, Google Workspace, SAML).
+- **Interactive Browser SSO**: Opens Moodle's mobile launch page and captures `openmoodle://token=...` after checking the passport. A temporary URL handler is registered on macOS, Linux, and Windows; you can also paste the link.
 - **Terminal CLI**: Run commands like `open-moodle attendance`, `open-moodle search`, `open-moodle download`, or `open-moodle brief` directly in your shell.
 - **Zero-Install Execution**: Works instantly with `uvx open-moodle` or via standard `pip`/`pipx`.
 
@@ -123,9 +123,9 @@ agy mcp add moodle uvx --from git+https://github.com/sonstellar969/open-moodle.g
 
 *(If credentials are saved via `open-moodle login`, they are loaded automatically. Otherwise, pass `--env MOODLE_URL=... --env MOODLE_TOKEN=...`.)*
 
-### Claude Desktop & Grok
+### Claude Desktop
 
-Add this block to your MCP configuration file (`claude_desktop_config.json`):
+Add this block to `claude_desktop_config.json`:
 
 ```json
 {
@@ -143,6 +143,22 @@ Add this block to your MCP configuration file (`claude_desktop_config.json`):
 ```
 
 *(Or use `"command": "uvx"` with `"args": ["--from", "git+https://github.com/sonstellar969/open-moodle.git", "open-moodle", "mcp"]`)*
+
+### Grok
+
+Grok Build reads `~/.grok/config.toml`, not Claude's config file. If you already ran `open-moodle login`, the server picks up the saved token and you can omit the environment variables.
+
+```bash
+grok mcp add moodle -- open-moodle mcp
+```
+
+Or, in `~/.grok/config.toml`:
+
+```toml
+[mcp_servers.moodle]
+command = "open-moodle"
+args = ["mcp"]
+```
 
 ### Cursor
 
@@ -231,7 +247,7 @@ See the [Client Setup Guide](docs/client-setup.md) for instructions covering Cla
 
 ## MCP Tools Provided
 
-The server exposes 13 tools:
+The server exposes 14 tools:
 
 | Tool | Parameters | Purpose |
 |------|------------|---------|
@@ -244,10 +260,11 @@ The server exposes 13 tools:
 | `moodle_get_course_contents` | `course_id: int` | Outlines syllabus sections, modules, and resources (with sanitized URLs). |
 | `moodle_read_resource` | `file_url: str, start_page: int = 1, max_pages: int = 20` | Downloads and parses a PDF, DOCX, PPTX, or text file with page range support. |
 | `moodle_upcoming_deadlines` | `days_ahead: int = 30` | Returns scheduled quizzes, assignments, and calendar events. |
-| `moodle_get_assignments` | `course_ids: list[int]?` | Lists assignments, due dates, submission states (`Submitted`, `Draft`), and grading status. |
+| `moodle_get_assignments` | `course_id: int = 0` | Lists assignments, due dates, submission states (`Submitted`, `Draft`), and grading status. `0` means every course. |
 | `moodle_get_announcements` | `course_id: int, limit: int = 10` | Fetches instructor announcements and posts from the course Announcements forum. |
 | `moodle_get_grades` | `course_id: int = 0` | Pulls grade items, marks, percentages, and teacher feedback. |
 | `moodle_notifications` | `limit: int = 15` | Fetches recent system bell alerts and personal notices. |
+| `moodle_doctor` | None | Lists which web service functions this token can call, and which features those functions unlock. |
 
 ---
 
@@ -272,6 +289,7 @@ All commands accept global flags `--url <URL>` and `--token <TOKEN>` to override
 | `search` | `<query> [-c COURSE] [-n 5]` | Sub-millisecond BM25 keyword search across locally indexed course slides and notes with excerpts. |
 | `download` | `<course_id> [-d, --dest PATH]` | Bulk downloads all course files into topic folders, automatically skipping unmodified files. |
 | `read` | `<file_url> [-s 1] [-p 20]` | Downloads and extracts readable text directly from a remote file URL with page windowing. |
+| `doctor` | None | Shows which Moodle web services this token can call. |
 | `mcp` | None | Runs the Model Context Protocol (MCP) server over standard input/output (stdio) for AI assistants. |
 
 ---
@@ -285,7 +303,7 @@ Authenticates with your university's Moodle portal.
   ```bash
   open-moodle login
   ```
-- **Campus SSO login**: opens your default browser to complete Microsoft 365, Google Workspace, or SAML SSO, automatically capturing the token:
+- **Campus SSO login**: opens Moodle's mobile launch page (`urlscheme=openmoodle`). Moodle redirects to `openmoodle://token=<base64>`. The payload is `md5(wwwroot + passport):::token`, and a mismatch is rejected. Paste the link if the temporary URL handler does not catch it:
   ```bash
   open-moodle login --sso
   ```
@@ -299,6 +317,8 @@ Verifies connection and prints student profile metadata:
 ```bash
 open-moodle whoami
 ```
+
+`open-moodle doctor` prints the same connection plus a line for each feature (courses, calendar, grades, forums, attendance) and whether the required web service is enabled.
 
 #### 3. `open-moodle courses`
 Lists all courses you are enrolled in with their numeric Course IDs (needed for other commands):
@@ -315,8 +335,13 @@ open-moodle attendance
 # Check against custom threshold (e.g., 80% or 85%)
 open-moodle attendance --threshold 80.0
 ```
-- For courses $\ge \text{threshold}$: displays safe bunks remaining: $\lfloor \frac{\text{attended} - T \times \text{total}}{T} \rfloor$.
-- For courses $< \text{threshold}$: displays consecutive classes needed to recover: $\lceil \frac{T \times \text{total} - \text{attended}}{1 - T} \rceil$.
+Most student tokens only receive a gradebook percentage. In that case the table shows the percentage and does not invent session counts or safe bunks.
+
+When a record includes real `attended` and `total` session counts:
+
+- For courses at or above the threshold: safe bunks remaining are $\lfloor \frac{\text{attended} - T \times \text{total}}{T} \rfloor$.
+- For courses below the threshold: consecutive classes needed are $\lceil \frac{T \times \text{total} - \text{attended}}{1 - T} \rceil$.
+- A 100% target cannot be recovered after a session has already been missed.
 
 #### 5. `open-moodle brief`
 Single-screen student briefing summarizing everything you need to know for the coming week:
@@ -360,7 +385,7 @@ open-moodle sync 201
 ```
 
 #### 11. `open-moodle search`
-Fast local keyword search across all indexed PDFs, slides, and docs with BM25 snippet ranking:
+Fast local keyword search across indexed PDFs, slides, and docs. Results include the page or slide and a token-free file URL:
 ```bash
 # Search across all indexed courses
 open-moodle search "virtual memory"
@@ -385,7 +410,14 @@ Downloads a remote Moodle file URL and extracts clean readable text in terminal:
 open-moodle read "https://lms.university.edu/webservice/pluginfile.php/123/mod_resource/content/1/notes.pdf" --start 1 --pages 10
 ```
 
-#### 14. `open-moodle mcp`
+#### 14. `open-moodle doctor`
+Prints which web services this token can call:
+
+```bash
+open-moodle doctor
+```
+
+#### 15. `open-moodle mcp`
 Launches the Model Context Protocol (MCP) stdio server for AI assistants (Antigravity, Claude, Cursor, Grok, Zed):
 ```bash
 open-moodle mcp
@@ -395,9 +427,10 @@ open-moodle mcp
 
 ## Architecture & Storage
 
-- **Configuration**: Credentials are saved to `~/.config/open-moodle/config.json` with restricted `0600` permissions.
-- **Search Index**: Embedded SQLite FTS5 database stored at `~/.cache/open-moodle/search_index.db` (configurable with `OPEN_MOODLE_CACHE_DIR`).
-- **Read-Only**: The tool strictly consumes data; it does not submit assignments, modify grades, or alter forum discussions.
+- **Configuration**: Credentials are saved to `~/.config/open-moodle/config.json`. The file is created with mode `0600`.
+- **Search Index**: SQLite FTS5 database at `~/.cache/open-moodle/search_index.db` (or `OPEN_MOODLE_CACHE_DIR`), created with mode `0600`. Sync indexes every page of a PDF or slide deck. `.doc` and `.ppt` files are skipped. Re-sync drops files that disappeared from the course. Search hits include the page label and a URL with the token removed.
+- **Downloads**: File fetches are limited to `pluginfile.php` on the configured Moodle host. A URL on any other host is refused, so a tool call cannot send your token elsewhere.
+- **Read-only client**: The commands do not submit assignments, change grades, or post to forums. The saved value is still a `moodle_mobile_app` token, and that service can allow writes on some sites. Treat the config file like a password.
 
 ---
 
@@ -413,3 +446,5 @@ open-moodle mcp
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+Text extraction from PDFs uses PyMuPDF, which is licensed under AGPL-3.0. That license applies to PyMuPDF itself when you install the dependency.

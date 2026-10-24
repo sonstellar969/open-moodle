@@ -10,6 +10,8 @@ from open_moodle.client import (
     FileTooLargeError,
     MoodleAPIError,
     MoodleClient,
+    UnsafeDownloadError,
+    calculate_attendance_metrics,
     flatten_moodle_params,
     strip_token_from_url,
 )
@@ -119,8 +121,6 @@ def test_download_file_size_limit_exceeded():
 
 
 def test_calculate_attendance_metrics():
-    from open_moodle.client import calculate_attendance_metrics
-
     # Over threshold (34/44 = 77.27% -> 1 safe bunk)
     m1 = calculate_attendance_metrics(34, 44, threshold=75.0)
     assert m1["status"] == "OK"
@@ -140,20 +140,32 @@ def test_calculate_attendance_metrics():
     assert m3["status"] == "OK"
     assert m3["safe_bunks"] == 0
 
+    # 100% is unreachable after a miss
+    m4 = calculate_attendance_metrics(9, 10, threshold=100.0)
+    assert m4["status"] == "BELOW TARGET"
+    assert m4["recovery_possible"] is False
+    assert m4["recovery_needed"] is None
 
-def test_get_attendance_via_mod_attendance():
+
+def test_get_attendance_from_gradebook_does_not_invent_sessions():
     client = MoodleClient("https://lms.college.edu", "secret_tok")
-    client._available_functions = {"mod_attendance_get_attendance"}
+    client._available_functions = {"gradereport_user_get_grade_items"}
+    client._user_id = 7
 
     mock_resp = MagicMock()
     mock_resp.json.return_value = {
-        "courses": [
+        "usergrades": [
             {
                 "courseid": 201,
-                "coursename": "Operating Systems",
-                "totalsessions": 44,
-                "attended": 34,
-                "percentage": 77.27,
+                "coursefullname": "Operating Systems",
+                "gradeitems": [
+                    {
+                        "itemname": "Attendance",
+                        "graderaw": 18,
+                        "grademax": 20,
+                        "percentageformatted": "90.00 %",
+                    }
+                ],
             }
         ]
     }
@@ -163,9 +175,11 @@ def test_get_attendance_via_mod_attendance():
         records = client.get_attendance()
         assert len(records) == 1
         assert records[0]["course_name"] == "Operating Systems"
-        assert records[0]["attended"] == 34
-        assert records[0]["total_sessions"] == 44
-        assert records[0]["percentage"] == 77.27
+        assert records[0]["percentage"] == 90.0
+        assert records[0]["sessions_known"] is False
+        assert records[0]["attended"] is None
+        assert records[0]["total_sessions"] is None
+        assert records[0]["source"] == "gradebook"
 
     client.close()
 
@@ -175,8 +189,22 @@ def test_get_attendance_capability_error():
     client._available_functions = {"core_webservice_get_site_info"}
     client._site_info = {"sitename": "Test"}
 
-    with pytest.raises(CapabilityError, match="Attendance tracking functions"):
+    with pytest.raises(CapabilityError, match="student tokens cannot read"):
         client.get_attendance()
 
+    client.close()
+
+
+def test_download_rejects_foreign_host():
+    client = MoodleClient("https://lms.college.edu", "secret_token_123")
+    with pytest.raises(UnsafeDownloadError, match="other than the configured Moodle site"):
+        client.download_file("https://evil.example/pluginfile.php/1/notes.pdf")
+    client.close()
+
+
+def test_download_rejects_non_pluginfile():
+    client = MoodleClient("https://lms.college.edu", "secret_token_123")
+    with pytest.raises(UnsafeDownloadError, match="pluginfile.php"):
+        client.download_file("https://lms.college.edu/webservice/rest/server.php")
     client.close()
 

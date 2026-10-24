@@ -69,6 +69,22 @@ def test_extract_magic_bytes_without_filename():
     assert "Anonymous File Content" in text
 
 
+def test_extract_all_pages_when_unlimited():
+    import pymupdf
+    doc = pymupdf.open()
+    for label in ("Alpha", "Beta", "Gamma"):
+        page = doc.new_page()
+        page.insert_text((50, 72), label)
+    data = doc.tobytes()
+    doc.close()
+    windowed = extract_content(data, filename="notes.pdf", max_pages=1)
+    full = extract_content(data, filename="notes.pdf", max_pages=None)
+    assert "Page 1" in windowed
+    assert "Page 3" not in windowed
+    assert "Page 3" in full
+    assert "Gamma" in full
+
+
 def test_extract_corrupted_pdf_handles_gracefully():
     corrupted = b"%PDF-1.5 this is not valid binary pdf content"
     text = extract_content(corrupted, filename="corrupted.pdf")

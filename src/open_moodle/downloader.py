@@ -7,20 +7,40 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Optional
 
-from open_moodle.client import FileTooLargeError, MoodleClient
+from open_moodle.client import MoodleClient
+
+
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 def sanitize_filename(name: str, max_length: int = 120) -> str:
-    """Sanitize directory or file name for all filesystem platforms."""
-    # Replace illegal filesystem characters with underscores
-    cleaned = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    if not cleaned:
+    """Sanitize a single path segment for every common filesystem."""
+    # Keep only the last segment so names like ../secret cannot escape a folder.
+    cleaned = name.replace("\\", "/").split("/")[-1]
+    cleaned = re.sub(r'[\\/*?:"<>|]', "_", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(".")
+    if not cleaned or cleaned in {".", ".."}:
         cleaned = "unnamed"
+    stem = os.path.splitext(cleaned)[0].upper()
+    if stem in _WINDOWS_RESERVED:
+        cleaned = f"_{cleaned}"
     if len(cleaned) > max_length:
         base, ext = os.path.splitext(cleaned)
-        cleaned = base[: max_length - len(ext)] + ext
+        cleaned = base[: max(1, max_length - len(ext))] + ext
     return cleaned
+
+
+def _path_inside(root: Path, candidate: Path) -> Path:
+    """Resolve candidate and refuse anything outside root."""
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise ValueError(f"Refusing to write outside {resolved_root}")
+    return resolved
 
 
 def download_course_materials(
@@ -57,11 +77,21 @@ def download_course_materials(
     skipped = 0
     failed = 0
     total_bytes = 0
+    errors: list[str] = []
+    claimed: set[Path] = set()
 
     for idx, (sec_folder, filename, file_url, filesize) in enumerate(items_to_process, start=1):
-        target_dir = dest_dir / sec_folder
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / sanitize_filename(filename)
+        try:
+            target_dir = _path_inside(dest_dir, dest_dir / sec_folder)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = _allocate_path(target_dir, filename, claimed)
+            target_path = _path_inside(dest_dir, target_path)
+        except ValueError as exc:
+            failed += 1
+            errors.append(f"{filename}: {exc}")
+            if progress_callback:
+                progress_callback(filename, idx, total, "failed")
+            continue
 
         # Check if file exists and matches size
         if target_path.exists() and filesize > 0 and target_path.stat().st_size == filesize:
@@ -83,8 +113,9 @@ def download_course_materials(
             total_bytes += len(data)
             if progress_callback:
                 progress_callback(filename, idx, total, "done")
-        except (FileTooLargeError, Exception):
+        except Exception as exc:
             failed += 1
+            errors.append(f"{filename}: {exc}")
             if progress_callback:
                 progress_callback(filename, idx, total, "failed")
 
@@ -96,4 +127,18 @@ def download_course_materials(
         "skipped": skipped,
         "failed": failed,
         "total_bytes": total_bytes,
+        "errors": errors[:8],
     }
+
+
+def _allocate_path(target_dir: Path, filename: str, claimed: set[Path]) -> Path:
+    """Pick a free file name so two resources cannot overwrite each other."""
+    safe = sanitize_filename(filename)
+    stem, suffix = os.path.splitext(safe)
+    candidate = target_dir / safe
+    number = 2
+    while candidate in claimed:
+        candidate = target_dir / f"{stem}_{number}{suffix}"
+        number += 1
+    claimed.add(candidate)
+    return candidate

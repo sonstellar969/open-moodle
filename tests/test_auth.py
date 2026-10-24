@@ -63,8 +63,14 @@ def test_extract_token_from_callback():
     url = f"http://127.0.0.1:8080/callback?token={raw_token}"
     assert extract_token_from_callback(url) == raw_token
 
-    # Base64 encoded passport:::token
+    # Moodle launch payload is md5(wwwroot + passport):::wstoken:::privatetoken
     import base64
-    payload = base64.b64encode(f"passport123:::{raw_token}".encode("utf-8")).decode("utf-8")
-    assert extract_token_from_callback(f"moodlemobile://token={payload}") == raw_token
+    import hashlib
+    passport = "passport123"
+    site = "https://lms.college.edu"
+    site_id = hashlib.md5((site + passport).encode("utf-8")).hexdigest()
+    payload = base64.b64encode(f"{site_id}:::{raw_token}:::private".encode("utf-8")).decode("utf-8")
+    launch = f"openmoodle://token={payload}"
+    assert extract_token_from_callback(launch, passport=passport, site_url=site) == raw_token
+    assert extract_token_from_callback(launch, passport="wrong", site_url=site) is None
 

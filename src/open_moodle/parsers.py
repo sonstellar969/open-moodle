@@ -7,7 +7,7 @@ import re
 from typing import Optional
 
 
-def parse_pdf(data: bytes, start_page: int = 1, max_pages: int = 20) -> str:
+def parse_pdf(data: bytes, start_page: int = 1, max_pages: Optional[int] = 20) -> str:
     """Extract plain text from PDF bytes within a page range using PyMuPDF."""
     import pymupdf
 
@@ -18,7 +18,10 @@ def parse_pdf(data: bytes, start_page: int = 1, max_pages: int = 20) -> str:
 
     total_pages = len(doc)
     start_idx = max(0, start_page - 1)
-    end_idx = min(total_pages, start_idx + max_pages)
+    if max_pages is None:
+        end_idx = total_pages
+    else:
+        end_idx = min(total_pages, start_idx + max(0, max_pages))
 
     output = []
     output.append(f"# PDF Document ({total_pages} pages total, reading pages {start_idx + 1}-{end_idx})\n")
@@ -85,7 +88,7 @@ def parse_docx(data: bytes) -> str:
     return "\n\n".join(output)
 
 
-def parse_pptx(data: bytes, start_slide: int = 1, max_slides: int = 20) -> str:
+def parse_pptx(data: bytes, start_slide: int = 1, max_slides: Optional[int] = 20) -> str:
     """Extract slide text and tables from PPTX bytes using python-pptx."""
     from pptx import Presentation
 
@@ -96,7 +99,10 @@ def parse_pptx(data: bytes, start_slide: int = 1, max_slides: int = 20) -> str:
 
     total_slides = len(prs.slides)
     start_idx = max(0, start_slide - 1)
-    end_idx = min(total_slides, start_idx + max_slides)
+    if max_slides is None:
+        end_idx = total_slides
+    else:
+        end_idx = min(total_slides, start_idx + max(0, max_slides))
 
     output = []
     output.append(f"# Presentation ({total_slides} slides total, reading slides {start_idx + 1}-{end_idx})\n")
@@ -159,7 +165,7 @@ def extract_content(
     filename: str = "",
     mime_type: str = "",
     start_page: int = 1,
-    max_pages: int = 20,
+    max_pages: Optional[int] = 20,
 ) -> str:
     """Inspect file signature and name, then route to the appropriate parser."""
     import urllib.parse
