@@ -163,7 +163,17 @@ Add to your project's `.cursor/mcp.json` or configure under **Cursor Settings ->
 }
 ```
 
-See the [Client Setup Guide](docs/client-setup.md) for full instructions covering Claude Code, Windsurf, and Zed.
+### Local & Open-Source Models (LM Studio, Continue.dev, Ollama)
+
+You can run `open-moodle` with 100% local models (Qwen 2.5, Llama 3.1/3.3, Mistral) to ensure your campus lecture notes, assignments, and grades remain strictly on your machine.
+
+- **LM Studio**: Add `"open-moodle": {"command": "open-moodle", "args": ["mcp"]}` to your LM Studio Developer/MCP settings.
+- **Continue.dev (VS Code)**: Add `open-moodle` under `experimental.modelContextProtocolServers` in `~/.continue/config.json`.
+- **Ollama / LibreChat / Open WebUI**: Connect via stdio MCP or custom Python agents.
+
+See the complete [Local & Open-Source Models Guide](docs/local-models.md) for full configurations and recommended tool-calling models.
+
+See the [Client Setup Guide](docs/client-setup.md) for instructions covering Claude Code, Windsurf, and Zed.
 
 ---
 
@@ -341,6 +351,7 @@ open-moodle mcp
 
 ## Documentation
 
+- [Local & Open-Source Models Guide](docs/local-models.md): Setup for Ollama, LM Studio, Continue.dev, Open WebUI, and LibreChat.
 - [Authentication & Token Guide](docs/authentication.md): Mobile token acquisition, SSO launch flow, and troubleshooting.
 - [Client Setup Guide](docs/client-setup.md): Config examples for Antigravity, Claude, Cursor, Grok, and others.
 - [Moodle API Reference](docs/moodle-api.md): Standard REST web service functions used under the hood.
